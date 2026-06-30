@@ -40,7 +40,7 @@
 Simply clone the repository and run the launcher. The installer will automatically configure Ollama, start the service, pull the `qwen2.5-coder:1.5b` model, set up a virtual environment, install dependencies, and **globally link the command** to `~/.local/bin/db-agent`:
 
 ```bash
-git clone <repository_url> db-agent
+git clone https://github.com/SSHRIHARI006/DB-AGENT.git db-agent
 cd db-agent
 ./db-agent
 ```
