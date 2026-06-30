@@ -1,0 +1,19 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info/
+
+# Virtual environments
+.venv/
+
+# Local databases
+*.db
+
+# db-agent session directories, settings, and logs
+.db_agent/
+
+# Documentation / Specs
+Technical Specification.md

@@ -1,0 +1,21 @@
+[build-system]
+requires = ["setuptools>=61.0.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "db-agent"
+version = "0.1.0"
+description = "Terminal database CLI assistant using Qwen via Ollama"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "mcp>=0.1.0",
+    "sqlalchemy>=2.0.0",
+    "ollama>=0.1.0",
+    "rich>=13.0.0",
+    "pymysql>=1.1.0",
+    "psycopg2-binary>=2.9.0"
+]
+
+[project.scripts]
+db-agent = "db_agent.cli:main"
