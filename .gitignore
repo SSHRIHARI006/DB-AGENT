@@ -8,12 +8,18 @@ wheels/
 
 # Virtual environments
 .venv/
+venv/
+env/
 
 # Local databases
 *.db
+*.sqlite3
 
 # db-agent session directories, settings, and logs
 .db_agent/
+
+# OS generated files
+.DS_Store
 
 # Documentation / Specs
 Technical Specification.md

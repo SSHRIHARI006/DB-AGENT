@@ -63,7 +63,8 @@ def add_rollback_entry(
     table: str,
     query: str,
     before: List[Dict[str, Any]],
-    primary_keys: List[str]
+    primary_keys: List[str],
+    commit_group_id: str = None
 ) -> str:
     init_session(session_name)
     stack = load_rollback_stack(session_name)
@@ -73,6 +74,7 @@ def add_rollback_entry(
     
     entry = {
         "commit_hash": commit_hash,
+        "commit_group_id": commit_group_id or commit_hash,
         "timestamp": timestamp,
         "operation": operation.upper(),
         "table": table,
@@ -84,7 +86,7 @@ def add_rollback_entry(
     stack.append(entry)
     save_rollback_stack(session_name, stack)
     
-    append_history_log(session_name, commit_hash, operation, table, query, len(before))
+    append_history_log(session_name, commit_hash, operation, table, query, len(before), commit_group_id)
     
     return commit_hash
 
@@ -94,14 +96,16 @@ def append_history_log(
     operation: str,
     table: str,
     query: str,
-    row_count: int
+    row_count: int,
+    commit_group_id: str = None
 ) -> None:
     session_dir = get_session_dir(session_name)
     history_md_path = os.path.join(session_dir, "DB_HISTORY.md")
     
     timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    group_str = f" (Group: `{commit_group_id}`)" if commit_group_id else ""
     log_entry = (
-        f"\n### Commit `{commit_hash}`\n"
+        f"\n### Commit `{commit_hash}`{group_str}\n"
         f"- **Timestamp:** {timestamp}\n"
         f"- **Operation:** {operation.upper()}\n"
         f"- **Table:** `{table}`\n"

@@ -86,24 +86,28 @@ async def handle_undo(db_uri: str, session_name: str) -> None:
         console.print("[red]Error: No modifications found in rollback stack.[/red]")
         return
         
-    last_entry = stack.pop()
-    inverse_queries = generate_inverse_queries(last_entry)
+    last_entry = stack[-1]
+    group_id = last_entry.get("commit_group_id", last_entry.get("commit_hash"))
     
-    if not inverse_queries:
-        console.print("[yellow]Warning: No compensating queries generated for the last commit.[/yellow]")
-        save_rollback_stack(session_name, stack)
-        return
+    entries_to_undo = []
+    while stack and stack[-1].get("commit_group_id", stack[-1].get("commit_hash")) == group_id:
+        entries_to_undo.append(stack.pop())
         
     try:
         engine = create_engine(db_uri)
         with engine.begin() as conn:
-            for sql, params in inverse_queries:
-                conn.execute(text(sql), params)
-                
+            for entry in entries_to_undo:
+                inverse_queries = generate_inverse_queries(entry)
+                for sql, params in inverse_queries:
+                    conn.execute(text(sql), params)
+                    
         save_rollback_stack(session_name, stack)
-        console.print(f"[green]Reverted last {last_entry['operation']} on table '{last_entry['table']}' successfully.[/green]")
+        console.print(f"[green]Reverted {len(entries_to_undo)} operation(s) in commit group '{group_id}' successfully.[/green]")
     except Exception as e:
         console.print(f"[red]Error executing rollback: {str(e)}[/red]")
+        entries_to_undo.reverse()
+        stack.extend(entries_to_undo)
+        save_rollback_stack(session_name, stack)
 
 async def handle_log(session_name: str) -> None:
     stack = load_rollback_stack(session_name)
@@ -192,8 +196,8 @@ def parse_fallback_tool_calls(content: str) -> List[Dict[str, Any]]:
     return tool_calls
 
 async def run_chat_loop(db_uri: str, session_name: str, mcp_session: ClientSession):
-    ollama_client = ollama.AsyncClient(host="http://localhost:11434")
-    model_name = "qwen2.5-coder:1.5b"
+    from db_agent.agents.orchestrator import plan_dag
+    from db_agent.agents.worker import execute_task
     
     init_session(session_name)
     chat_messages = load_chat_memory(session_name)
@@ -235,171 +239,54 @@ async def run_chat_loop(db_uri: str, session_name: str, mcp_session: ClientSessi
         except Exception as e:
             schema_text = f"Could not reflect database schema: {str(e)}"
             
-        stack = load_rollback_stack(session_name)
-        if stack:
-            history_lines = []
-            for entry in stack:
-                history_lines.append(f"- Commit {entry['commit_hash']}: {entry['operation']} on table '{entry['table']}' (Query: {entry['query']})")
-            history_text = "\n".join(history_lines)
-        else:
-            history_text = "No database mutations have been recorded in this session yet."
+        with console.status("[bold green]Orchestrating tasks...") as status:
+            dag = await plan_dag(user_query, schema_text)
             
-        system_prompt = (
-            "You are an autonomous CLI database assistant. Your goal is to help the user manage "
-            "their SQL database using natural language. You have access to tools to read and write to the database.\n\n"
-            "CRITICAL RULES:\n"
-            "1. If the user asks a general question, conversational query, or meta-question about the conversation/session history (e.g. 'what have we done', 'tell me about the last operation', or general greeting), "
-            "answer it directly using the context and history. Do NOT call tools for conversational queries.\n"
-            "2. Read-only queries (SELECT) must use the `read_query` tool.\n"
-            "3. Mutations (INSERT, UPDATE, DELETE) must use `execute_smart_mutation`.\n"
-            "4. Do NOT execute structural changes (DDL) like CREATE TABLE, DROP, or ALTER. Schema modifications are blocked. If the user asks to create a table, explain that they must create the table manually using their own SQL tool first.\n"
-            "5. Always formulate the correct query using the database schema provided below.\n\n"
-            f"CURRENT DATABASE SCHEMA:\n{schema_text}\n\n"
-            f"RECORDED MUTATIONS IN THIS SESSION:\n{history_text}"
-        )
-        
-        chat_messages = [msg for msg in chat_messages if msg.get("role") != "system"]
-        chat_messages.insert(0, {"role": "system", "content": system_prompt})
-        
-        mcp_tools = await mcp_session.list_tools()
-        ollama_tools = []
-        for t in mcp_tools.tools:
-            ollama_tools.append({
-                "type": "function",
-                "function": {
-                    "name": t.name,
-                    "description": t.description,
-                    "parameters": t.inputSchema
-                }
-            })
+        if not dag:
+            console.print("[red]Failed to generate an execution plan for this query.[/red]")
+            continue
             
-        valid_tool_names = [t.name for t in mcp_tools.tools]
-        executed_calls_in_turn = set()
-        loop_count = 0
-        max_loops = 5
+        console.print(f"[cyan]Generated DAG with {len(dag)} atomic operation(s).[/cyan]")
         
-        while True:
-            if loop_count >= max_loops:
-                console.print("[yellow]Warning: Maximum agent tool call depth reached. Breaking loop to prevent infinite run.[/yellow]")
+        group_id = secrets.token_hex(4)
+        
+        completed = set()
+        task_results = []
+        
+        while len(completed) < len(dag):
+            runnable_tasks = [t for t in dag if t["id"] not in completed and all(dep in completed for dep in t.get("depends_on", []))]
+            
+            if not runnable_tasks:
+                console.print("[red]Error: Circular dependency or unresolvable tasks in DAG.[/red]")
                 break
                 
-            with console.status("[bold green]Thinking...") as status:
-                try:
-                    response = await ollama_client.chat(
-                        model=model_name,
-                        messages=chat_messages,
-                        tools=ollama_tools
-                    )
-                except Exception as chat_err:
-                    console.print(f"[red]Ollama Error: {str(chat_err)}[/red]")
-                    break
-                    
-            msg = response.message
-            
-            calls = []
-            if msg.tool_calls:
-                for tc in msg.tool_calls:
-                    tname = tc.function.name
-                    if tname in valid_tool_names:
-                        call_id = getattr(tc, "id", None) or f"call_{secrets.token_hex(4)}"
-                        calls.append({
-                            "id": call_id,
-                            "name": tname,
-                            "arguments": tc.function.arguments
-                        })
-                    else:
-                        console.print(f"[yellow]Ignored invalid tool call '{tname}' suggested by model.[/yellow]")
-            else:
-                fallback_calls = parse_fallback_tool_calls(msg.content)
-                if fallback_calls:
-                    for c in fallback_calls:
-                        tname = c["name"]
-                        if tname in valid_tool_names:
-                            calls.append({
-                                "id": f"call_{secrets.token_hex(4)}",
-                                "name": tname,
-                                "arguments": c["arguments"]
-                            })
-                        else:
-                            console.print(f"[yellow]Ignored invalid fallback tool call '{tname}' suggested by model.[/yellow]")
-            
-            if calls:
-                loop_count += 1
-                assistant_msg = {
-                    "role": "assistant",
-                    "content": msg.content or "",
-                    "tool_calls": [
-                        {
-                            "id": c["id"],
-                            "type": "function",
-                            "function": {
-                                "name": c["name"],
-                                "arguments": c["arguments"]
-                            }
-                        } for c in calls
-                    ]
-                }
-                chat_messages.append(assistant_msg)
+            async def run_worker(task):
+                console.print(f"[yellow]Running Task {task['id']}: {task.get('intent')}[/yellow]")
+                result = await execute_task(task, schema_text, group_id, mcp_session)
+                if result["status"] == "success":
+                    console.print(f"[green]Task {task['id']} completed.[/green]")
+                else:
+                    console.print(f"[red]Task {task['id']} failed: {result['result']}[/red]")
+                return task["id"], result
                 
-                for tool_call in calls:
-                    name = tool_call["name"]
-                    args = tool_call["arguments"]
-                    
-                    try:
-                        args_str = json.dumps(args, sort_keys=True)
-                    except Exception:
-                        args_str = str(args)
-                    call_key = (name, args_str)
-                    
-                    if call_key in executed_calls_in_turn:
-                        console.print(f"[yellow]Bypassed repeating tool call '{name}' to prevent loop.[/yellow]")
-                        chat_messages.append({
-                            "role": "tool",
-                            "tool_call_id": tool_call["id"],
-                            "name": name,
-                            "content": f"Error: The tool call '{name}' with these arguments was already executed and failed. Do not repeat the same call. Explain the issue (e.g., table does not exist) to the user."
-                        })
-                        continue
-                        
-                    executed_calls_in_turn.add(call_key)
-                    console.print(f"[cyan]Agent executing: {name} (Args: {args})[/cyan]")
-                    
-                    try:
-                        tool_result = await mcp_session.call_tool(name, args)
-                        
-                        result_text = ""
-                        if hasattr(tool_result, "content"):
-                            for block in tool_result.content:
-                                if block.type == "text":
-                                    result_text += block.text
-                                else:
-                                    result_text += str(block)
-                        else:
-                            result_text = str(tool_result)
-                            
-                        chat_messages.append({
-                            "role": "tool",
-                            "tool_call_id": tool_call["id"],
-                            "name": name,
-                            "content": result_text
-                        })
-                    except Exception as tool_err:
-                        console.print(f"[red]Tool error: {str(tool_err)}[/red]")
-                        chat_messages.append({
-                            "role": "tool",
-                            "tool_call_id": tool_call["id"],
-                            "name": name,
-                            "content": f"Error: {str(tool_err)}"
-                        })
-                continue
-            else:
-                console.print(Panel(Markdown(msg.content or ""), border_style="green", title="db-agent"))
-                chat_messages.append({
-                    "role": "assistant",
-                    "content": msg.content or ""
-                })
-                save_chat_memory(session_name, [m for m in chat_messages if m.get("role") != "system"])
+            batch_results = await asyncio.gather(*(run_worker(t) for t in runnable_tasks))
+            
+            has_failure = False
+            for tid, result in batch_results:
+                task_results.append(f"Task {tid}: {result['result']}")
+                if result["status"] != "success":
+                    has_failure = True
+                completed.add(tid)
+                
+            if has_failure:
+                console.print("[red]Aborting remaining DAG execution due to task failure.[/red]")
                 break
+                
+        summary = "\n".join(task_results)
+        console.print(Panel(Markdown("Execution complete:\n" + summary), border_style="green", title="db-agent"))
+        chat_messages.append({"role": "assistant", "content": f"Executed DAG.\nResults:\n{summary}"})
+        
+        save_chat_memory(session_name, [m for m in chat_messages if m.get("role") != "system"])
 
 def get_char() -> str:
     fd = sys.stdin.fileno()

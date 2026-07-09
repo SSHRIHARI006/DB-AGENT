@@ -65,7 +65,7 @@ def read_query(sql_query: str) -> str:
         return f"Error executing read query: {str(e)}"
 
 @mcp.tool()
-def execute_smart_mutation(table_name: str, sql_query: str, where_condition: str) -> str:
+def execute_smart_mutation(table_name: str, sql_query: str, where_condition: str, commit_group_id: str = None) -> str:
     upper_query = sql_query.strip().upper()
     
     if "DROP" in upper_query or "ALTER" in upper_query:
@@ -118,7 +118,8 @@ def execute_smart_mutation(table_name: str, sql_query: str, where_condition: str
             table=table_name,
             query=sql_query,
             before=before_rows,
-            primary_keys=primary_keys
+            primary_keys=primary_keys,
+            commit_group_id=commit_group_id
         )
         
         return json.dumps({

@@ -1,48 +1,41 @@
-# db-agent: Autonomous CLI Database Assistant
+# DB-Agent v2: Autonomous Hierarchical Database Assistant
 
-`db-agent` is a terminal-based autonomous database assistant. It allows you to query, mutate, inspect, and roll back SQL databases using natural language. The system operates fully locally, ensuring privacy and reliability by combining a local LLM with the Model Context Protocol (MCP).
+`db-agent` is a terminal-based autonomous database assistant. It allows you to query, mutate, inspect, and roll back SQL databases using natural language. The v2 architecture introduces a **Hierarchical Multi-Agent System** that breaks down complex requests into actionable DAGs (Directed Acyclic Graphs), operating entirely locally for maximum privacy.
 
 ---
 
 ## Key Features
 
-- **Natural Language Interaction**: Query (`SELECT`) and mutate (`INSERT`, `UPDATE`, `DELETE`) your database using conversational English.
-- **State Timeline & Time-Travel Rollbacks**:
-  - `/log`: Displays a detailed audit timeline of database changes made in the session.
-  - `/undo`: Safely rolls back the last mutation transaction.
+- **Multi-Agent Architecture**: 
+  - **Orchestrator Agent**: A `7B` model parses complex, multi-step queries into a JSON DAG of atomic tasks.
+  - **Worker Agent**: A fast `0.5B` model executes each task in the DAG asynchronously, complete with an auto-healing feedback loop for syntax errors.
+- **Natural Language Interaction**: Process complex queries containing multiple reads and mutations (`INSERT`, `UPDATE`, `DELETE`) in a single prompt.
+- **State Timeline & Group Rollbacks**:
+  - `/log`: Displays a detailed audit timeline of database changes.
+  - `/undo`: Safely rolls back the *entire group* of mutations from your last complex query simultaneously.
   - `/revert <hash>`: Sequentially unwinds database records back to a specific commit checkpoint.
 - **Interactive Workspace & Session Manager**:
   - Arrow-key navigation menu to browse and select existing sessions.
-  - Clean isolated session contexts (`session_config.json`, history, and transaction logs).
-  - Hotkey session deletion (`d`/`D` with confirmation).
-- **Execution Safety & Guardrails**:
-  - **DDL Blocking**: Structural schema modifications (`CREATE TABLE`, `DROP`, `ALTER`) are strictly blocked for security.
-  - **Turn-Level Deduplication**: Intercepts repeating failed queries to prevent infinite agent tool loops.
-- **Multi-Database Support**: Out-of-the-box support for SQLite, PostgreSQL, MySQL, and other SQLAlchemy-supported databases.
+- **Cross-Platform Compatibility**: A unified Python installation wizard supporting Windows, macOS, and Linux.
 
 ---
 
 ## Prerequisites
 
 1. **Python**: `3.12` or higher.
-2. **Ollama**: A local instance of Ollama running on your PC.
+2. **Ollama**: A local instance of Ollama running on your machine.
    - [Download Ollama](https://ollama.com/)
-   - Pull the default local coding model:
-     ```bash
-     ollama pull qwen2.5-coder:1.5b
-     ```
-3. **Database Server**: A local or remote database (SQLite, PostgreSQL, MySQL) to connect to.
 
 ---
 
 ## Quick Start (Seamless Setup)
 
-Simply clone the repository and run the launcher. The installer will automatically configure Ollama, start the service, pull the `qwen2.5-coder:1.5b` model, set up a virtual environment, install dependencies, and **globally link the command** to `~/.local/bin/db-agent`:
+Simply clone the repository and run the cross-platform setup wizard. It will automatically verify Python, download Ollama (if missing on Linux), pull the required models (`qwen2.5-coder:7b` & `0.5b`), and link the `db-agent` command globally:
 
 ```bash
 git clone https://github.com/SSHRIHARI006/DB-AGENT.git db-agent
 cd db-agent
-./db-agent
+python install.py
 ```
 
 ### Run from Anywhere
@@ -50,15 +43,15 @@ Once the setup is complete, you can type `db-agent` from any directory in your t
 ```bash
 db-agent
 ```
-*(Ensure `~/.local/bin` is in your system's PATH variable).*
+*(Ensure `~/.local/bin` (Linux/Mac) or your Python Scripts folder (Windows) is in your system's PATH variable).*
 
 ---
 
 ## Alternative Usage
 
-### Option B: Connect Directly to a Database
+### Connect Directly to a Database
 ```bash
-db-agent postgresql://username:password@localhost/dbname --session my_pg_session
+db-agent sqlite:///test.db --session my_project
 ```
 
 ---
@@ -69,8 +62,8 @@ Inside the natural language chat prompt, you can use these special commands to c
 
 | Command | Description |
 | :--- | :--- |
-| `/log` | Renders a styled table detailing session transaction history & commit hashes. |
-| `/undo` | Rolls back the single most recent database mutation. |
+| `/log` | Renders a styled table detailing session transaction history & group commit hashes. |
+| `/undo` | Rolls back all mutations originating from the single most recent query. |
 | `/revert <hash>` | Rolls back all mutations sequentially up to the specified commit hash. |
 | `/exit` or `exit` | Safely disconnects the active database connection and returns to the main menu. |
 
