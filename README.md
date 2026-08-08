@@ -1,76 +1,83 @@
-# DB-Agent v2: Autonomous Hierarchical Database Assistant
+# DB-Agent: Autonomous Database Assistant
 
-`db-agent` is a terminal-based autonomous database assistant. It allows you to query, mutate, inspect, and roll back SQL databases using natural language. The v2 architecture introduces a **Hierarchical Multi-Agent System** that breaks down complex requests into actionable DAGs (Directed Acyclic Graphs), operating entirely locally for maximum privacy.
+`db-agent` is a terminal database assistant that plans and executes SQL operations through an Orchestrator and Worker agent. It supports rollback tracking, session isolation, and selectable remote LLM providers.
 
----
+## Providers
 
-## Key Features
+Configure one of these providers inside a session:
 
-- **Multi-Agent Architecture**: 
-  - **Orchestrator Agent**: A `7B` model parses complex, multi-step queries into a JSON DAG of atomic tasks.
-  - **Worker Agent**: A fast `0.5B` model executes each task in the DAG asynchronously, complete with an auto-healing feedback loop for syntax errors.
-- **Natural Language Interaction**: Process complex queries containing multiple reads and mutations (`INSERT`, `UPDATE`, `DELETE`) in a single prompt.
-- **State Timeline & Group Rollbacks**:
-  - `/log`: Displays a detailed audit timeline of database changes.
-  - `/undo`: Safely rolls back the *entire group* of mutations from your last complex query simultaneously.
-  - `/revert <hash>`: Sequentially unwinds database records back to a specific commit checkpoint.
-- **Interactive Workspace & Session Manager**:
-  - Arrow-key navigation menu to browse and select existing sessions.
-- **Cross-Platform Compatibility**: A unified Python installation wizard supporting Windows, macOS, and Linux.
+- Gemini
+- OpenRouter
+- Ollama Cloud
+- NVIDIA NIM
+- Groq
 
----
+OpenAI and Anthropic are intentionally not included in this provider set.
 
 ## Prerequisites
 
-1. **Python**: `3.12` or higher.
-2. **Ollama**: A local instance of Ollama running on your machine.
-   - [Download Ollama](https://ollama.com/)
+- Python 3.12+
+- A SQLAlchemy database URI
+- An API key for the selected provider, supplied through the provider-specific environment variable or a masked prompt
 
----
+Supported `.env` variables:
 
-## Quick Start (Seamless Setup)
+```text
+groq_api_key=
+ollama-cloud_api_key=
+gemini_api_key=
+openrouter_api_key=
+nvidia_api_key=
+```
 
-Simply clone the repository and run the cross-platform setup wizard. It will automatically verify Python, download Ollama (if missing on Linux), pull the required models (`qwen2.5-coder:7b` & `0.5b`), and link the `db-agent` command globally:
+The equivalent `DBAGENT_*_KEY` environment variables are also accepted for compatibility.
+
+Keys entered at the prompt are held only in process memory and are never written to session files. Environment configuration stores only the variable name reference.
+
+## Setup
 
 ```bash
 git clone https://github.com/SSHRIHARI006/DB-AGENT.git db-agent
 cd db-agent
-python install.py
+python3 install.py
 ```
 
-### Run from Anywhere
-Once the setup is complete, you can type `db-agent` from any directory in your terminal to start the assistant:
-```bash
-db-agent
-```
-*(Ensure `~/.local/bin` (Linux/Mac) or your Python Scripts folder (Windows) is in your system's PATH variable).*
+Start a session directly:
 
----
-
-## Alternative Usage
-
-### Connect Directly to a Database
 ```bash
 db-agent sqlite:///test.db --session my_project
 ```
 
----
+## Provider and model commands
 
-## Chat Loop Special Commands
+Inside the session:
 
-Inside the natural language chat prompt, you can use these special commands to control your database state:
+```text
+/provider set <gemini|openrouter|ollama_cloud|nvidia_nim|groq>
+/provider switch <name>
+/provider list
+/provider status
+/models list
+/models refresh
+/models use orchestrator <model-id>
+/models use worker <model-id>
+```
 
-| Command | Description |
-| :--- | :--- |
-| `/log` | Renders a styled table detailing session transaction history & group commit hashes. |
-| `/undo` | Rolls back all mutations originating from the single most recent query. |
-| `/revert <hash>` | Rolls back all mutations sequentially up to the specified commit hash. |
-| `/exit` or `exit` | Safely disconnects the active database connection and returns to the main menu. |
+A request runs only after both the Orchestrator and Worker models are explicitly selected. Model lists are cached per session for 24 hours, with stale-cache and static fallback behavior for network failures.
 
----
+## Database commands
 
-## Database Driver Packages
-The application installs the following drivers by default:
-- **SQLite**: Built-in Python library.
-- **PostgreSQL**: `psycopg2-binary`
-- **MySQL / MariaDB**: `pymysql`
+```text
+/log
+/undo
+/revert <hash>
+/exit
+```
+
+Session state is stored under `.db_agent/sessions/<session>/`. Raw provider API keys are never serialized there.
+
+## Database drivers
+
+- SQLite: built into Python
+- PostgreSQL: `psycopg2-binary`
+- MySQL/MariaDB: `pymysql`

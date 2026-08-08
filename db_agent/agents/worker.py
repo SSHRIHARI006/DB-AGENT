@@ -1,9 +1,11 @@
 import json
-import ollama
 import re
-from typing import Dict, Any
+from typing import Any
 
-def parse_fallback_tool_calls(content: str) -> list[dict]:
+from db_agent.providers import ProviderAdapter, ToolCall
+
+
+def parse_fallback_tool_calls(content: str) -> list[dict[str, Any]]:
     if not content:
         return []
     tool_calls = []
@@ -23,7 +25,11 @@ def parse_fallback_tool_calls(content: str) -> list[dict]:
         except Exception:
             pass
     if not tool_calls:
-        matches = re.finditer(r"\{\s*\"name\"\s*:\s*\"[^\"]+\"\s*,\s*\"arguments\"\s*:\s*\{.*?\}\s*\}", content, re.DOTALL)
+        matches = re.finditer(
+            r"\{\s*\"name\"\s*:\s*\"[^\"]+\"\s*,\s*\"arguments\"\s*:\s*\{.*?\}\s*\}",
+            content,
+            re.DOTALL,
+        )
         for match in matches:
             try:
                 data = json.loads(match.group(0))
@@ -32,27 +38,48 @@ def parse_fallback_tool_calls(content: str) -> list[dict]:
                 pass
     return tool_calls
 
-async def execute_task(task: dict, schema_text: str, group_id: str, mcp_session, max_retries=3) -> dict:
+
+def _normalized_calls(result, valid_tool_names: set[str]) -> list[dict[str, Any]]:
+    calls = []
+    for call in result.tool_calls or []:
+        if isinstance(call, ToolCall):
+            name, arguments = call.name, call.arguments
+        else:
+            name, arguments = call.get("name"), call.get("arguments")
+        if name in valid_tool_names and isinstance(arguments, dict):
+            calls.append({"name": name, "arguments": arguments})
+    if not calls:
+        calls = [
+            call
+            for call in parse_fallback_tool_calls(result.text)
+            if call.get("name") in valid_tool_names and isinstance(call.get("arguments"), dict)
+        ]
+    return calls
+
+
+async def execute_task(
+    task: dict,
+    schema_text: str,
+    group_id: str,
+    mcp_session,
+    adapter: ProviderAdapter,
+    model: str,
+    max_retries: int = 3,
+) -> dict[str, str]:
     intent = task.get("intent", "")
-    
     mcp_tools = await mcp_session.list_tools()
-    ollama_tools = []
-    valid_tool_names = []
-    for t in mcp_tools.tools:
-        valid_tool_names.append(t.name)
-        tool_schema = {
-            "type": "function",
-            "function": {
-                "name": t.name,
-                "description": t.description,
-                "parameters": t.inputSchema
+    provider_tools = []
+    valid_tool_names = set()
+    for tool in mcp_tools.tools:
+        valid_tool_names.add(tool.name)
+        provider_tools.append(
+            {
+                "name": tool.name,
+                "description": tool.description,
+                "parameters": tool.inputSchema,
             }
-        }
-        ollama_tools.append(tool_schema)
-        
-    client = ollama.AsyncClient(host="http://localhost:11434")
-    model_name = "qwen2.5-coder:0.5b"
-    
+        )
+
     error_context = ""
     messages = [
         {
@@ -64,50 +91,36 @@ async def execute_task(task: dict, schema_text: str, group_id: str, mcp_session,
                 "2. Mutations (INSERT, UPDATE, DELETE) must use `execute_smart_mutation`.\n"
                 "3. Structural database modifications (DDL) are blocked.\n"
                 f"CURRENT DATABASE SCHEMA:\n{schema_text}"
-            )
+            ),
         }
     ]
-    
-    for attempt in range(max_retries):
+
+    for _ in range(max_retries):
         current_msg = f"Intent: {intent}\n"
         if error_context:
             current_msg += f"{error_context}\nFix the SQL and try again."
-            
         temp_messages = messages + [{"role": "user", "content": current_msg}]
-        
+
         try:
-            response = await client.chat(
-                model=model_name,
+            result = await adapter.generate(
                 messages=temp_messages,
-                tools=ollama_tools,
-                options={"temperature": 0.1}
+                model=model,
+                tools=provider_tools,
+                temperature=0.1,
             )
-        except Exception as e:
-            return {"status": "error", "result": f"LLM Connection Error: {str(e)}"}
-            
-        msg = response.message
-        calls = []
-        if msg.tool_calls:
-            for tc in msg.tool_calls:
-                if tc.function.name in valid_tool_names:
-                    calls.append({
-                        "name": tc.function.name,
-                        "arguments": tc.function.arguments
-                    })
-        else:
-            calls = parse_fallback_tool_calls(msg.content)
-            
+        except Exception as exc:
+            return {"status": "error", "result": f"LLM Connection Error: {exc}"}
+
+        calls = _normalized_calls(result, valid_tool_names)
         if not calls:
             error_context = "Error: You did not output a valid tool call. You MUST call a tool like execute_smart_mutation or read_query."
             continue
-            
-        # Execute the first valid tool call found
+
         call = calls[0]
-        args = call["arguments"]
-        
+        args = dict(call["arguments"])
         if call["name"] == "execute_smart_mutation":
             args["commit_group_id"] = group_id
-            
+
         try:
             tool_result = await mcp_session.call_tool(call["name"], args)
             result_text = ""
@@ -119,15 +132,11 @@ async def execute_task(task: dict, schema_text: str, group_id: str, mcp_session,
                         result_text += str(block)
             else:
                 result_text = str(tool_result)
-                
-            if "error" in result_text.lower() and "status" not in result_text.lower():
+            if "error" in result_text.lower() and '"status": "success"' not in result_text.lower():
                 error_context = f"Previous attempt failed: {result_text}"
                 continue
-                
             return {"status": "success", "result": result_text}
-            
-        except Exception as e:
-            error_context = f"Previous attempt failed with exception: {str(e)}"
-            continue
-            
+        except Exception as exc:
+            error_context = f"Previous attempt failed with exception: {exc}"
+
     return {"status": "error", "result": f"Auto-healing failed after {max_retries} attempts. Last error: {error_context}"}

@@ -1,0 +1,12 @@
+{
+  "permissions": {
+    "allow": [
+      "Shell(python -m compileall -q db_agent)",
+      "Shell(.venv/bin/python:*)",
+      "Shell(command:*)",
+      "Shell(uv:*)"
+    ],
+    "deny": [],
+    "defaultMode": "default"
+  }
+}

@@ -2,7 +2,6 @@ import os
 import sys
 import subprocess
 import platform
-import shutil
 import venv
 
 def run_command(cmd, shell=False, check=True):
@@ -25,36 +24,7 @@ def main():
         print("[Error] Python 3.12+ is required.")
         sys.exit(1)
         
-    # 2. Check/Install Ollama
-    if not shutil.which("ollama"):
-        print("Ollama is not installed.")
-        if system == "linux":
-            print("Installing Ollama for Linux...")
-            run_command("curl -fsSL https://ollama.com/install.sh | sh", shell=True)
-        elif system == "darwin":
-            print("Please download and install Ollama for Mac: https://ollama.com/download/mac")
-            sys.exit(1)
-        elif system == "windows":
-            print("Please download and install Ollama for Windows: https://ollama.com/download/windows")
-            sys.exit(1)
-    else:
-        print("Ollama is already installed.")
-
-    # 3. Pull models
-    print("Pulling Qwen2.5 Coder models...")
-    try:
-        subprocess.run(["ollama", "list"], check=True, capture_output=True)
-    except subprocess.CalledProcessError:
-        print("Ollama service does not appear to be running. Please start Ollama and run this script again.")
-        sys.exit(1)
-    except FileNotFoundError:
-        print("Ollama command not found in PATH.")
-        sys.exit(1)
-
-    run_command(["ollama", "pull", "qwen2.5-coder:7b"])
-    run_command(["ollama", "pull", "qwen2.5-coder:0.5b"])
-
-    # 4. Create virtual environment
+    # 2. Create virtual environment
     print("Creating virtual environment...")
     venv_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".venv")
     builder = venv.EnvBuilder(with_pip=True)

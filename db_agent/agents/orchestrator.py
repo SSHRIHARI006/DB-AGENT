@@ -1,7 +1,15 @@
 import json
-import ollama
+from typing import Any
 
-async def plan_dag(user_query: str, schema_text: str) -> list:
+from db_agent.providers import ProviderAdapter
+
+
+async def plan_dag(
+    user_query: str,
+    schema_text: str,
+    adapter: ProviderAdapter,
+    model: str,
+) -> list[dict[str, Any]]:
     prompt = f"""You are a database query orchestrator. Your job is to break down complex natural language database requests into a JSON array of atomic operations.
 Each operation must represent a single atomic intent (e.g., read data, insert one record, update one record, delete one record).
 
@@ -19,20 +27,16 @@ Rules:
 
 User Request: {user_query}
 """
-    client = ollama.AsyncClient(host="http://localhost:11434")
-    
     try:
-        response = await client.generate(
-            model="qwen2.5-coder:7b",
+        result = await adapter.generate(
             prompt=prompt,
-            options={"temperature": 0.1},
-            format="json"
+            model=model,
+            temperature=0.1,
+            response_format="json",
         )
-        
-        dag = json.loads(response.response)
+        dag = json.loads(result.text)
         if not isinstance(dag, list):
             dag = [dag]
         return dag
-    except Exception as e:
-        # Fallback in case of error
+    except Exception:
         return [{"id": 1, "intent": user_query, "depends_on": []}]

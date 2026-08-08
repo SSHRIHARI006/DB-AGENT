@@ -8,9 +8,9 @@ import secrets
 import tty
 import termios
 import shutil
+import datetime
 from typing import List, Dict, Any
 
-import ollama
 from sqlalchemy import create_engine, text
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
@@ -20,6 +20,7 @@ from rich.panel import Panel
 from rich.markdown import Markdown
 from rich.table import Table
 
+from db_agent.env_loader import load_dotenv
 from db_agent.tracker import (
     init_session,
     load_chat_memory,
@@ -29,8 +30,30 @@ from db_agent.tracker import (
     generate_inverse_queries,
     save_session_config,
     load_session_config,
-    get_all_sessions
+    get_all_sessions,
 )
+from db_agent.model_cache import get_models
+from db_agent.provider_config import (
+    ProviderConfig,
+    env_value_for,
+    env_var_for,
+    key_source,
+    load_provider_config,
+    prompt_key,
+    resolve_api_key,
+    save_provider_config,
+    selected_models,
+    set_selected_model,
+)
+from db_agent.providers import (
+    ProviderError,
+    create_adapter,
+    supported_providers,
+)
+from db_agent.providers.factory import PROVIDER_ENV_VARS
+from db_agent.providers.static_models import STATIC_MODELS
+
+ROLE_LABELS = {"orchestrator": "Orchestrator", "worker": "Worker"}
 
 console = Console()
 
@@ -59,26 +82,165 @@ async def check_dependencies(db_uri: str) -> bool:
         engine = create_engine(db_uri)
         with engine.connect() as conn:
             conn.execute(text("SELECT 1"))
-    except Exception as e:
-        console.print(f"[red]Database Connection Error: Cannot connect using the provided URI.[/red]")
-        console.print(f"[red]Detail: {str(e)}[/red]")
+    except Exception as exc:
+        console.print("[red]Database Connection Error: Cannot connect using the provided URI.[/red]")
+        console.print(f"[red]Detail: {exc}[/red]")
         return False
-
-    try:
-        client = ollama.AsyncClient(host="http://localhost:11434")
-        models_response = await client.list()
-        pulled_models = [m.model for m in models_response.models]
-        
-        target_model = "qwen2.5-coder:1.5b"
-        if not any(target_model in m or "qwen2.5-coder" in m for m in pulled_models):
-            console.print(f"[yellow]Warning: Model '{target_model}' was not found in local Ollama daemon.[/yellow]")
-            console.print(f"[yellow]Please run 'ollama pull {target_model}' to ensure responses work correctly.[/yellow]")
-    except Exception as e:
-        console.print("[red]Ollama Connection Error: Cannot communicate with Ollama daemon at http://localhost:11434.[/red]")
-        console.print("[yellow]Please ensure Ollama is installed and running (`ollama serve`).[/yellow]")
-        return False
-        
     return True
+
+
+def _provider_config_or_error(session_name: str) -> ProviderConfig | None:
+    config = load_provider_config(session_name)
+    if not config.active_provider or config.active_provider not in config.providers:
+        console.print("[yellow]No active provider. Use /provider set <name> first.[/yellow]")
+        return None
+    return config
+
+
+def _format_age(fetched_at) -> str:
+    if fetched_at is None:
+        return "unavailable"
+    age = datetime.datetime.now(datetime.timezone.utc) - fetched_at
+    return f"{max(0, int(age.total_seconds() // 3600))}h"
+
+
+async def handle_provider_command(session_name: str, parts: list[str]) -> None:
+    if len(parts) < 2:
+        console.print("[yellow]Usage: /provider set|switch|list|status <provider>[/yellow]")
+        return
+    action = parts[1].lower()
+    config = load_provider_config(session_name)
+
+    if action == "set":
+        if len(parts) != 3 or parts[2] not in supported_providers():
+            console.print(f"[red]Provider must be one of: {', '.join(supported_providers())}[/red]")
+            return
+        provider = parts[2]
+        configured_key = env_value_for(provider)
+        env_name, api_key = configured_key if configured_key else (env_var_for(provider), None)
+        from_environment = configured_key is not None
+        adapter = None
+        try:
+            if not api_key:
+                api_key = prompt_key(session_name, provider)
+            adapter = create_adapter(provider, api_key)
+            await adapter.validate_key()
+            model_result = await get_models(session_name, provider, adapter, force_refresh=True)
+            if not model_result.models:
+                console.print(f"[red]Provider '{provider}' returned no usable models.[/red]")
+                return
+            from db_agent.provider_config import ProviderEntry
+            config.providers[provider] = ProviderEntry(
+                api_key_ref=f"env:{env_name}" if from_environment else "prompt"
+            )
+            if not config.active_provider:
+                config.active_provider = provider
+            save_provider_config(session_name, config)
+            console.print(f"[green]Configured {provider} with {len(model_result.models)} available model(s).[/green]")
+            console.print(f"[cyan]Assign roles with /models use orchestrator <id> and /models use worker <id>.[/cyan]")
+            if model_result.warning:
+                console.print(f"[yellow]{model_result.warning}[/yellow]")
+        except ProviderError as exc:
+            console.print(f"[red]Provider validation failed: {exc}[/red]")
+        except ValueError as exc:
+            console.print(f"[red]{exc}[/red]")
+        finally:
+            if adapter:
+                await adapter.close()
+        return
+
+    if action == "switch":
+        if len(parts) != 3 or parts[2] not in config.providers:
+            console.print("[red]That provider is not configured. Use /provider set <name> first.[/red]")
+            return
+        config.active_provider = parts[2]
+        save_provider_config(session_name, config)
+        console.print(f"[green]Active provider switched to {parts[2]}.[/green]")
+        return
+
+    if action == "list":
+        table = Table(title=f"Configured Providers (Session: {session_name})")
+        table.add_column("Provider", style="cyan")
+        table.add_column("Active", style="green")
+        table.add_column("Key Source", style="yellow")
+        for provider, entry in config.providers.items():
+            table.add_row(provider, "yes" if provider == config.active_provider else "", key_source(entry, session_name, provider))
+        console.print(table if config.providers else "[yellow]No providers configured.[/yellow]")
+        return
+
+    if action == "status":
+        if not config.active_provider or config.active_provider not in config.providers:
+            console.print("[yellow]No active provider configured.[/yellow]")
+            return
+        provider = config.active_provider
+        entry = config.providers[provider]
+        adapter = None
+        try:
+            adapter = create_adapter(provider, resolve_api_key(session_name, provider, entry), entry.base_url)
+            cache = await get_models(session_name, provider, adapter)
+            orchestrator_model, worker_model = selected_models(config, provider)
+            console.print(
+                f"[cyan]Provider:[/cyan] {provider}\n"
+                f"[cyan]Key source:[/cyan] {key_source(entry, session_name, provider)}\n"
+                f"[cyan]Model cache:[/cyan] {cache.source} ({_format_age(cache.fetched_at)})\n"
+                f"[cyan]Orchestrator model:[/cyan] {orchestrator_model or 'not selected'}\n"
+                f"[cyan]Worker model:[/cyan] {worker_model or 'not selected'}"
+            )
+        except ProviderError as exc:
+            console.print(f"[red]Provider status failed: {exc}[/red]")
+        finally:
+            if adapter:
+                await adapter.close()
+        return
+
+    console.print("[yellow]Usage: /provider set|switch|list|status <provider>[/yellow]")
+
+
+async def handle_models_command(session_name: str, parts: list[str]) -> None:
+    config = _provider_config_or_error(session_name)
+    if config is None:
+        return
+    provider = config.active_provider
+    entry = config.providers[provider]
+    try:
+        adapter = create_adapter(provider, resolve_api_key(session_name, provider, entry), entry.base_url)
+    except (ProviderError, ValueError) as exc:
+        console.print(f"[red]{exc}[/red]")
+        return
+    try:
+        if len(parts) >= 2 and parts[1].lower() == "use":
+            if len(parts) != 4 or parts[2].lower() not in ROLE_LABELS:
+                console.print("[yellow]Usage: /models use orchestrator|worker <model-id>[/yellow]")
+                return
+            model_id = parts[3]
+            result = await get_models(session_name, provider, adapter)
+            if not any(model.id == model_id for model in result.models):
+                console.print(f"[red]Model '{model_id}' is not available for {provider}.[/red]")
+                return
+            set_selected_model(config, provider, parts[2].lower(), model_id)
+            save_provider_config(session_name, config)
+            console.print(f"[green]{ROLE_LABELS[parts[2].lower()]} model set to {model_id}.[/green]")
+            return
+        if len(parts) != 2 or parts[1].lower() not in {"list", "refresh"}:
+            console.print("[yellow]Usage: /models list|refresh or /models use orchestrator|worker <model-id>[/yellow]")
+            return
+        result = await get_models(session_name, provider, adapter, force_refresh=parts[1].lower() == "refresh")
+        table = Table(title=f"Models for {provider} ({result.source})")
+        for column in ("Model ID", "Display Name", "Context", "Tools", "Thinking"):
+            table.add_column(column)
+        for model in result.models:
+            table.add_row(
+                model.id,
+                model.display_name,
+                str(model.context_window or "unknown"),
+                str(model.supports_tools if model.supports_tools is not None else "unknown"),
+                str(model.supports_thinking if model.supports_thinking is not None else "unknown"),
+            )
+        console.print(table if result.models else "[yellow]No models available.[/yellow]")
+        if result.warning:
+            console.print(f"[yellow]{result.warning}[/yellow]")
+    finally:
+        await adapter.close()
 
 async def handle_undo(db_uri: str, session_name: str) -> None:
     stack = load_rollback_stack(session_name)
@@ -198,12 +360,11 @@ def parse_fallback_tool_calls(content: str) -> List[Dict[str, Any]]:
 async def run_chat_loop(db_uri: str, session_name: str, mcp_session: ClientSession):
     from db_agent.agents.orchestrator import plan_dag
     from db_agent.agents.worker import execute_task
-    
+
     init_session(session_name)
     chat_messages = load_chat_memory(session_name)
-    
     print_banner(db_uri, session_name)
-    
+
     while True:
         user_query = await asyncio.get_event_loop().run_in_executor(None, get_user_input)
         user_query = user_query.strip()
@@ -230,8 +391,31 @@ async def run_chat_loop(db_uri: str, session_name: str, mcp_session: ClientSessi
             else:
                 await handle_revert(db_uri, session_name, parts[1])
             continue
-            
+
+        elif user_query.startswith("/provider"):
+            await handle_provider_command(session_name, user_query.split())
+            continue
+
+        elif user_query.startswith("/models"):
+            await handle_models_command(session_name, user_query.split())
+            continue
+
         chat_messages.append({"role": "user", "content": user_query})
+
+        config = _provider_config_or_error(session_name)
+        if config is None:
+            continue
+        provider = config.active_provider
+        entry = config.providers[provider]
+        orchestrator_model, worker_model = selected_models(config, provider)
+        if not orchestrator_model or not worker_model:
+            console.print("[yellow]Choose both models before running a request: /models use orchestrator <id> and /models use worker <id>.[/yellow]")
+            continue
+        try:
+            adapter = create_adapter(provider, resolve_api_key(session_name, provider, entry), entry.base_url)
+        except (ProviderError, ValueError) as exc:
+            console.print(f"[red]Provider setup error: {exc}[/red]")
+            continue
         
         try:
             schema_resource = await mcp_session.read_resource("schema://current")
@@ -239,8 +423,8 @@ async def run_chat_loop(db_uri: str, session_name: str, mcp_session: ClientSessi
         except Exception as e:
             schema_text = f"Could not reflect database schema: {str(e)}"
             
-        with console.status("[bold green]Orchestrating tasks...") as status:
-            dag = await plan_dag(user_query, schema_text)
+        with console.status("[bold green]Orchestrating tasks..."):
+            dag = await plan_dag(user_query, schema_text, adapter, orchestrator_model)
             
         if not dag:
             console.print("[red]Failed to generate an execution plan for this query.[/red]")
@@ -262,7 +446,7 @@ async def run_chat_loop(db_uri: str, session_name: str, mcp_session: ClientSessi
                 
             async def run_worker(task):
                 console.print(f"[yellow]Running Task {task['id']}: {task.get('intent')}[/yellow]")
-                result = await execute_task(task, schema_text, group_id, mcp_session)
+                result = await execute_task(task, schema_text, group_id, mcp_session, adapter, worker_model)
                 if result["status"] == "success":
                     console.print(f"[green]Task {task['id']} completed.[/green]")
                 else:
@@ -285,8 +469,8 @@ async def run_chat_loop(db_uri: str, session_name: str, mcp_session: ClientSessi
         summary = "\n".join(task_results)
         console.print(Panel(Markdown("Execution complete:\n" + summary), border_style="green", title="db-agent"))
         chat_messages.append({"role": "assistant", "content": f"Executed DAG.\nResults:\n{summary}"})
-        
         save_chat_memory(session_name, [m for m in chat_messages if m.get("role") != "system"])
+        await adapter.close()
 
 def get_char() -> str:
     fd = sys.stdin.fileno()
@@ -471,6 +655,7 @@ async def run_cli():
             break
 
 def main():
+    load_dotenv()
     try:
         asyncio.run(run_cli())
     except KeyboardInterrupt:

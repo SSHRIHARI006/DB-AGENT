@@ -18,6 +18,10 @@ env/
 # db-agent session directories, settings, and logs
 .db_agent/
 
+# Local provider credentials
+.env
+.env.*
+
 # OS generated files
 .DS_Store
 
