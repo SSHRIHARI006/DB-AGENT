@@ -1,6 +1,11 @@
 # Python-generated files
 __pycache__/
 *.py[oc]
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+htmlcov/
 build/
 dist/
 wheels/
@@ -11,19 +16,32 @@ wheels/
 venv/
 env/
 
-# Local databases
+# Local databases and test artifacts
 *.db
 *.sqlite3
 
 # db-agent session directories, settings, and logs
 .db_agent/
 
+# Local assistant metadata
+.commandcode/
+
 # Local provider credentials
 .env
 .env.*
+!.env.example
 
-# OS generated files
+# OS and editor files
 .DS_Store
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Temporary files
+*.log
+*.tmp
+*.bak
 
 # Documentation / Specs
 Technical Specification.md

@@ -42,10 +42,30 @@ cd db-agent
 python3 install.py
 ```
 
+The installer does not install or pull local Ollama models. It reuses an existing `.venv` when present, installs the pinned MCP-compatible dependencies, and verifies the FastMCP import before completing.
+
+You can launch with either:
+
+```bash
+./db-agent sqlite:///test.db --session my_project
+```
+
+or, after installation:
+
+```bash
+~/.local/bin/db-agent sqlite:///test.db --session my_project
+```
+
+Create the local SQLite fixture for testing:
+
+```bash
+python3 populate_db.py
+```
+
 Start a session directly:
 
 ```bash
-db-agent sqlite:///test.db --session my_project
+./db-agent sqlite:///test.db --session my_project
 ```
 
 ## Provider and model commands

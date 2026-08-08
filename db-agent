@@ -1,20 +1,18 @@
 #!/usr/bin/env bash
-# db-agent - Automatically handle virtual environment and launch db-agent CLI
 
-# Resolve symlinks to find the real script directory
+set -euo pipefail
+
 SOURCE="${BASH_SOURCE[0]}"
 while [ -h "$SOURCE" ]; do
-  DIR="$( cd -P "$( dirname "$SOURCE" )" && pwd )"
-  SOURCE="$(readlink "$SOURCE")"
-  [[ $SOURCE != /* ]] && SOURCE="$DIR/$SOURCE"
+    DIR="$(cd -P "$(dirname "$SOURCE")" && pwd)"
+    SOURCE="$(readlink "$SOURCE")"
+    [[ "$SOURCE" != /* ]] && SOURCE="$DIR/$SOURCE"
 done
-DIR="$( cd -P "$( dirname "$SOURCE" )" && pwd )"
+DIR="$(cd -P "$(dirname "$SOURCE")" && pwd)"
 
-# Run setup if venv doesn't exist in the package directory
-if [ ! -d "$DIR/.venv" ]; then
+VENV_PYTHON="$DIR/.venv/bin/python"
+if [ ! -x "$VENV_PYTHON" ]; then
     bash "$DIR/setup.sh"
 fi
 
-# Run db-agent inside the virtual environment
-source "$DIR/.venv/bin/activate"
-exec db-agent "$@"
+exec "$VENV_PYTHON" -m db_agent.cli "$@"
