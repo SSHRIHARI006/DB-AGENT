@@ -56,12 +56,6 @@ or, after installation:
 ~/.local/bin/db-agent sqlite:///test.db --session my_project
 ```
 
-Create the local SQLite fixture for testing:
-
-```bash
-python3 populate_db.py
-```
-
 Start a session directly:
 
 ```bash

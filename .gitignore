@@ -43,5 +43,10 @@ env/
 *.tmp
 *.bak
 
+# Local-only development specs and helpers
+.specs/
+setup.sh
+populate_db.py
+
 # Documentation / Specs
 Technical Specification.md
