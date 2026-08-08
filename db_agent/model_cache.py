@@ -9,6 +9,32 @@ from db_agent.providers.static_models import STATIC_MODELS
 from db_agent.tracker import get_session_dir
 
 CACHE_TTL = dt.timedelta(hours=24)
+VALID_ROLES = {"orchestrator", "worker"}
+
+
+def models_for_role(models: list[ModelInfo], role: str | None) -> list[ModelInfo]:
+    if role is None:
+        return list(models)
+    if role not in VALID_ROLES:
+        raise ValueError("Role must be 'orchestrator' or 'worker'.")
+
+    filtered = []
+    for model in models:
+        if model.supports_chat is False:
+            continue
+        if model.modality and model.modality.lower() in {
+            "audio",
+            "embedding",
+            "image",
+            "vision-only",
+            "image-only",
+            "moderation",
+        }:
+            continue
+        if role == "worker" and model.supports_tools is False:
+            continue
+        filtered.append(model)
+    return filtered
 
 
 @dataclass
@@ -53,6 +79,7 @@ async def get_models(
     provider: str,
     adapter: ProviderAdapter,
     *,
+    role: str | None = None,
     force_refresh: bool = False,
 ) -> ModelListResult:
     cached = _read_cache(session_name, provider)
@@ -60,24 +87,24 @@ async def get_models(
     if cached and not force_refresh:
         models, fetched_at = cached
         if now - fetched_at < CACHE_TTL:
-            return ModelListResult(models, "cache", fetched_at)
+            return ModelListResult(models_for_role(models, role), "cache", fetched_at)
 
     try:
         models = await adapter.list_models()
         fetched_at = _write_cache(session_name, provider, models)
-        return ModelListResult(models, "live", fetched_at)
+        return ModelListResult(models_for_role(models, role), "live", fetched_at)
     except ProviderError as exc:
         if cached:
             models, fetched_at = cached
             return ModelListResult(
-                models,
+                models_for_role(models, role),
                 "stale cache",
                 fetched_at,
                 f"Live model refresh failed: {exc}",
             )
         models = STATIC_MODELS.get(provider, [])
         return ModelListResult(
-            list(models),
+            models_for_role(list(models), role),
             "static fallback",
             None,
             f"Live model listing failed: {exc}",

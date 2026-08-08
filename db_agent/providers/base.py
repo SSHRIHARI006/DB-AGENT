@@ -10,6 +10,8 @@ class ModelInfo:
     context_window: int | None = None
     supports_tools: bool | None = None
     supports_thinking: bool | None = None
+    supports_chat: bool | None = None
+    modality: str | None = None
 
 
 @dataclass(frozen=True)

@@ -26,15 +26,18 @@ from db_agent.tracker import (
     load_chat_memory,
     save_chat_memory,
     load_rollback_stack,
+    load_query_history,
     save_rollback_stack,
     generate_inverse_queries,
     save_session_config,
     load_session_config,
     get_all_sessions,
+    get_session_dir,
 )
-from db_agent.model_cache import get_models
+from db_agent.model_cache import get_models, models_for_role
 from db_agent.provider_config import (
     ProviderConfig,
+    ProviderEntry,
     env_value_for,
     env_var_for,
     key_source,
@@ -58,24 +61,121 @@ ROLE_LABELS = {"orchestrator": "Orchestrator", "worker": "Worker"}
 console = Console()
 
 def print_banner(db_uri: str, session_name: str):
+    config = load_provider_config(session_name)
+    provider = config.active_provider or "not configured"
+    orchestrator_model = "not selected"
+    worker_model = "not selected"
+    if provider in config.providers:
+        orchestrator_model, worker_model = selected_models(config, provider)
     banner_text = (
         f"# db-agent CLI\n\n"
         f"**Database URI:** `{db_uri}`\n"
-        f"**Active Session:** `{session_name}`\n\n"
+        f"**Active Session:** `{session_name}`\n"
+        f"**Provider:** `{provider}`\n"
+        f"**Orchestrator:** `{orchestrator_model or 'not selected'}`\n"
+        f"**Worker:** `{worker_model or 'not selected'}`\n\n"
         f"Ready to accept database requests in natural language.\n"
-        f"**Special Commands:**\n"
-        f"- `/undo`        : Revert the last database mutation operation.\n"
-        f"- `/log`         : Display the local commit history timeline.\n"
-        f"- `/revert <hash>`: Sequentially rollback to a specific commit hash.\n"
-        f"- `/exit` or `exit`: Safely shut down and quit the application."
+        f"Type `/` at an empty prompt to open the command menu.\n\n"
+        f"**Setup and Provider Commands:**\n"
+        f"- `/providers` : Open the interactive setup menu.\n"
+        f"- `/provider set <name>` : Configure a provider.\n"
+        f"- `/provider switch <name>` : Switch active provider.\n"
+        f"- `/provider assign <role> <model>` : Assign a role model.\n"
+        f"- `/provider list` / `/provider status` : Inspect provider state.\n\n"
+        f"**Model Commands:**\n"
+        f"- `/models list [--role worker|orchestrator]` : List available models.\n"
+        f"- `/models refresh` : Refresh the model catalog.\n"
+        f"- `/models use <role> <model>` : Assign a role model.\n\n"
+        f"**Database Commands:**\n"
+        f"- `/log` : Display commit history.\n"
+        f"- `/undo` : Revert the latest mutation group.\n"
+        f"- `/revert <hash>` : Restore a commit checkpoint.\n"
+        f"- `/exit` or `exit` : Leave the session."
     )
     console.print(Panel(Markdown(banner_text), border_style="cyan", expand=False))
 
 def get_user_input() -> str:
     try:
-        return input("\ndb-agent> ")
+        sys.stdout.write("\ndb-agent> ")
+        sys.stdout.flush()
+        chars = []
+        while True:
+            char = get_char()
+            if not char:
+                return "/exit"
+            if char == "/" and not chars:
+                sys.stdout.write("/\n")
+                sys.stdout.flush()
+                return _slash_command_menu()
+            if char in ("\r", "\n"):
+                sys.stdout.write("\n")
+                sys.stdout.flush()
+                return "".join(chars)
+            if char == "\x03":
+                return "/exit"
+            if char in ("\x08", "\x7f"):
+                if chars:
+                    chars.pop()
+                    sys.stdout.write("\b \b")
+                    sys.stdout.flush()
+                continue
+            if char.startswith("\x1b"):
+                continue
+            chars.append(char)
+            sys.stdout.write(char)
+            sys.stdout.flush()
     except (KeyboardInterrupt, EOFError):
         return "/exit"
+
+
+def _slash_command_menu() -> str:
+    commands = [
+        ("/providers  — setup menu", "/providers"),
+        ("/provider set  — configure provider", "provider_set"),
+        ("/provider switch  — switch provider", "provider_switch"),
+        ("/provider assign  — assign role model", "provider_assign"),
+        ("/provider list", "/provider list"),
+        ("/provider status", "/provider status"),
+        ("/models list", "/models list"),
+        ("/models list --role  — role filter", "models_role"),
+        ("/models refresh", "/models refresh"),
+        ("/models use  — assign role model", "models_use"),
+        ("/undo", "/undo"),
+        ("/log", "/log"),
+        ("/revert  — restore commit", "revert"),
+        ("/exit", "/exit"),
+    ]
+    selected = _select_menu("Select a command", commands)
+    if selected is None:
+        return ""
+    if selected == "provider_set":
+        provider = _select_menu(
+            "Select a provider",
+            [(name, name) for name in supported_providers()],
+        )
+        return f"/provider set {provider}" if provider else ""
+    if selected == "provider_switch":
+        session_name = open(os.path.join(".db_agent", "active_session.txt"), encoding="utf-8").read().strip() if os.path.exists(os.path.join(".db_agent", "active_session.txt")) else "default"
+        config = load_provider_config(session_name)
+        provider = _select_menu(
+            "Switch provider",
+            [(name, name) for name in config.providers],
+        )
+        return f"/provider switch {provider}" if provider else ""
+    if selected in {"provider_assign", "models_use"}:
+        role = _select_menu("Select a role", [(name.title(), name) for name in ROLE_LABELS])
+        if not role:
+            return ""
+        model = input("Model ID: ").strip()
+        command = "/provider assign" if selected == "provider_assign" else "/models use"
+        return f"{command} {role} {model}" if model else ""
+    if selected == "models_role":
+        role = _select_menu("Select a role", [(name.title(), name) for name in ROLE_LABELS])
+        return f"/models list --role {role}" if role else ""
+    if selected == "revert":
+        commit_hash = input("Commit hash: ").strip()
+        return f"/revert {commit_hash}" if commit_hash else ""
+    return selected
 
 async def check_dependencies(db_uri: str) -> bool:
     try:
@@ -97,6 +197,87 @@ def _provider_config_or_error(session_name: str) -> ProviderConfig | None:
     return config
 
 
+def _model_label(model) -> str:
+    tools = "✓" if model.supports_tools is True else "✗" if model.supports_tools is False else "?"
+    context = "—" if not model.context_window else (
+        f"{model.context_window // 1_000_000}M" if model.context_window >= 1_000_000
+        else f"{model.context_window // 1_000}K"
+    )
+    return f"{model.id}  tools {tools}  ctx {context}"
+
+
+def _role_model_is_valid(model, role: str) -> bool:
+    return model in models_for_role([model], role)
+
+
+async def _configuration_is_complete(session_name: str, config: ProviderConfig) -> bool:
+    if not config.active_provider or config.active_provider not in config.providers:
+        return False
+    provider = config.active_provider
+    entry = config.providers[provider]
+    adapter = None
+    try:
+        api_key = resolve_api_key(session_name, provider, entry)
+        if not api_key:
+            return False
+        orchestrator_model, worker_model = selected_models(config, provider)
+        if not orchestrator_model or not worker_model:
+            return False
+        adapter = create_adapter(provider, api_key, entry.base_url)
+        result = await get_models(session_name, provider, adapter)
+        models = {model.id: model for model in result.models}
+        return (
+            orchestrator_model in models
+            and worker_model in models
+            and _role_model_is_valid(models[orchestrator_model], "orchestrator")
+            and _role_model_is_valid(models[worker_model], "worker")
+        )
+    except (ProviderError, ValueError):
+        return False
+    finally:
+        if adapter:
+            await adapter.close()
+
+
+def _select_menu(title: str, options: list[tuple[str, object]], *, allow_back: bool = True):
+    entries = list(options)
+    if allow_back:
+        entries.append(("Back", None))
+    selected_idx = 0
+    console.print(f"\n[bold cyan]{title}[/bold cyan]")
+
+    def render(move_up: bool = False) -> None:
+        if move_up:
+            sys.stdout.write(f"\033[{max(0, len(entries) - 1)}A\033[1G\033[J")
+        for index, (label, _) in enumerate(entries):
+            marker = ">" if index == selected_idx else " "
+            if index == selected_idx:
+                line = f"\033[1;36m {marker} {label}\033[0m"
+            else:
+                line = f" {marker} {label}"
+            sys.stdout.write(line)
+            if index < len(entries) - 1:
+                sys.stdout.write("\n")
+        sys.stdout.flush()
+
+    render()
+    while True:
+        char = get_char()
+        if char == "\x1b[A" and selected_idx > 0:
+            selected_idx -= 1
+        elif char == "\x1b[B" and selected_idx < len(entries) - 1:
+            selected_idx += 1
+        elif char in ("\r", "\n"):
+            sys.stdout.write("\n")
+            sys.stdout.flush()
+            return entries[selected_idx][1]
+        elif char == "\x03":
+            raise KeyboardInterrupt
+        else:
+            continue
+        render(move_up=True)
+
+
 def _format_age(fetched_at) -> str:
     if fetched_at is None:
         return "unavailable"
@@ -106,7 +287,7 @@ def _format_age(fetched_at) -> str:
 
 async def handle_provider_command(session_name: str, parts: list[str]) -> None:
     if len(parts) < 2:
-        console.print("[yellow]Usage: /provider set|switch|list|status <provider>[/yellow]")
+        console.print("[yellow]Usage: /provider set|switch|assign|list|status[/yellow]")
         return
     action = parts[1].lower()
     config = load_provider_config(session_name)
@@ -115,38 +296,14 @@ async def handle_provider_command(session_name: str, parts: list[str]) -> None:
         if len(parts) != 3 or parts[2] not in supported_providers():
             console.print(f"[red]Provider must be one of: {', '.join(supported_providers())}[/red]")
             return
-        provider = parts[2]
-        configured_key = env_value_for(provider)
-        env_name, api_key = configured_key if configured_key else (env_var_for(provider), None)
-        from_environment = configured_key is not None
-        adapter = None
-        try:
-            if not api_key:
-                api_key = prompt_key(session_name, provider)
-            adapter = create_adapter(provider, api_key)
-            await adapter.validate_key()
-            model_result = await get_models(session_name, provider, adapter, force_refresh=True)
-            if not model_result.models:
-                console.print(f"[red]Provider '{provider}' returned no usable models.[/red]")
-                return
-            from db_agent.provider_config import ProviderEntry
-            config.providers[provider] = ProviderEntry(
-                api_key_ref=f"env:{env_name}" if from_environment else "prompt"
-            )
-            if not config.active_provider:
-                config.active_provider = provider
-            save_provider_config(session_name, config)
-            console.print(f"[green]Configured {provider} with {len(model_result.models)} available model(s).[/green]")
-            console.print(f"[cyan]Assign roles with /models use orchestrator <id> and /models use worker <id>.[/cyan]")
-            if model_result.warning:
-                console.print(f"[yellow]{model_result.warning}[/yellow]")
-        except ProviderError as exc:
-            console.print(f"[red]Provider validation failed: {exc}[/red]")
-        except ValueError as exc:
-            console.print(f"[red]{exc}[/red]")
-        finally:
-            if adapter:
-                await adapter.close()
+        await _configure_provider(session_name, parts[2], config)
+        return
+
+    if action == "assign":
+        if len(parts) != 4 or parts[2].lower() not in ROLE_LABELS:
+            console.print("[yellow]Usage: /provider assign worker|orchestrator <model-id>[/yellow]")
+            return
+        await _assign_model(session_name, config, parts[2].lower(), parts[3])
         return
 
     if action == "switch":
@@ -196,6 +353,32 @@ async def handle_provider_command(session_name: str, parts: list[str]) -> None:
     console.print("[yellow]Usage: /provider set|switch|list|status <provider>[/yellow]")
 
 
+async def _assign_model(session_name: str, config: ProviderConfig, role: str, model_id: str) -> bool:
+    if not config.active_provider or config.active_provider not in config.providers:
+        console.print("[yellow]Configure a provider first.[/yellow]")
+        return False
+    provider = config.active_provider
+    entry = config.providers[provider]
+    adapter = None
+    try:
+        adapter = create_adapter(provider, resolve_api_key(session_name, provider, entry), entry.base_url)
+        result = await get_models(session_name, provider, adapter, role=role)
+        model = next((item for item in result.models if item.id == model_id), None)
+        if model is None:
+            console.print(f"[red]Model '{model_id}' is not available for the {role} role.[/red]")
+            return False
+        set_selected_model(config, provider, role, model_id)
+        save_provider_config(session_name, config)
+        console.print(f"[green]{ROLE_LABELS[role]} model set to {model_id}.[/green]")
+        return True
+    except (ProviderError, ValueError) as exc:
+        console.print(f"[red]Model assignment failed: {exc}[/red]")
+        return False
+    finally:
+        if adapter:
+            await adapter.close()
+
+
 async def handle_models_command(session_name: str, parts: list[str]) -> None:
     config = _provider_config_or_error(session_name)
     if config is None:
@@ -212,20 +395,21 @@ async def handle_models_command(session_name: str, parts: list[str]) -> None:
             if len(parts) != 4 or parts[2].lower() not in ROLE_LABELS:
                 console.print("[yellow]Usage: /models use orchestrator|worker <model-id>[/yellow]")
                 return
-            model_id = parts[3]
-            result = await get_models(session_name, provider, adapter)
-            if not any(model.id == model_id for model in result.models):
-                console.print(f"[red]Model '{model_id}' is not available for {provider}.[/red]")
+            return await _assign_model(session_name, config, parts[2].lower(), parts[3])
+        if len(parts) >= 2 and parts[1].lower() == "list":
+            role = None
+            if len(parts) == 4 and parts[2] == "--role" and parts[3].lower() in ROLE_LABELS:
+                role = parts[3].lower()
+            elif len(parts) != 2:
+                console.print("[yellow]Usage: /models list [--role worker|orchestrator][/yellow]")
                 return
-            set_selected_model(config, provider, parts[2].lower(), model_id)
-            save_provider_config(session_name, config)
-            console.print(f"[green]{ROLE_LABELS[parts[2].lower()]} model set to {model_id}.[/green]")
+            result = await get_models(session_name, provider, adapter, role=role)
+        elif len(parts) == 2 and parts[1].lower() == "refresh":
+            result = await get_models(session_name, provider, adapter, force_refresh=True)
+        else:
+            console.print("[yellow]Usage: /models list [--role worker|orchestrator], /models refresh, or /models use <role> <model-id>[/yellow]")
             return
-        if len(parts) != 2 or parts[1].lower() not in {"list", "refresh"}:
-            console.print("[yellow]Usage: /models list|refresh or /models use orchestrator|worker <model-id>[/yellow]")
-            return
-        result = await get_models(session_name, provider, adapter, force_refresh=parts[1].lower() == "refresh")
-        table = Table(title=f"Models for {provider} ({result.source})")
+        table = Table(title=f"Models for {provider}" + (f" ({role})" if role else "") + f" [{result.source}]")
         for column in ("Model ID", "Display Name", "Context", "Tools", "Thinking"):
             table.add_column(column)
         for model in result.models:
@@ -241,6 +425,136 @@ async def handle_models_command(session_name: str, parts: list[str]) -> None:
             console.print(f"[yellow]{result.warning}[/yellow]")
     finally:
         await adapter.close()
+
+async def _configure_provider(session_name: str, provider: str, config: ProviderConfig) -> bool:
+    configured_key = env_value_for(provider)
+    env_name, api_key = configured_key if configured_key else (env_var_for(provider), None)
+    if not api_key and provider in config.providers:
+        api_key = resolve_api_key(session_name, provider, config.providers[provider])
+    adapter = None
+    try:
+        if not api_key:
+            api_key = prompt_key(session_name, provider)
+            api_key_ref = "prompt"
+        else:
+            api_key_ref = f"env:{env_name}" if configured_key else config.providers.get(provider, ProviderEntry("prompt")).api_key_ref
+        adapter = create_adapter(provider, api_key)
+        await adapter.validate_key()
+        result = await get_models(session_name, provider, adapter, force_refresh=True)
+        if not result.models:
+            console.print(f"[red]Provider '{provider}' returned no usable models.[/red]")
+            return False
+        config.providers[provider] = ProviderEntry(
+            api_key_ref=api_key_ref,
+            orchestrator_model=config.providers.get(provider, ProviderEntry(api_key_ref)).orchestrator_model if provider in config.providers else None,
+            worker_model=config.providers.get(provider, ProviderEntry(api_key_ref)).worker_model if provider in config.providers else None,
+            base_url=config.providers.get(provider, ProviderEntry(api_key_ref)).base_url if provider in config.providers else None,
+        )
+        config.active_provider = provider
+        save_provider_config(session_name, config)
+        console.print(f"[green]Configured {provider} with {len(result.models)} available model(s).[/green]")
+        return True
+    except (ProviderError, ValueError) as exc:
+        console.print(f"[red]Provider validation failed: {exc}[/red]")
+        return False
+    finally:
+        if adapter:
+            await adapter.close()
+
+
+async def _select_role_model(session_name: str, config: ProviderConfig, role: str) -> bool:
+    provider = config.active_provider
+    if not provider or provider not in config.providers:
+        console.print("[yellow]Configure a provider first.[/yellow]")
+        return False
+    entry = config.providers[provider]
+    adapter = None
+    try:
+        adapter = create_adapter(provider, resolve_api_key(session_name, provider, entry), entry.base_url)
+        result = await get_models(session_name, provider, adapter, role=role)
+        options = [(_model_label(model), model) for model in result.models]
+        if result.warning:
+            console.print(f"[yellow]{result.warning}[/yellow]")
+        if not options:
+            console.print(f"[yellow]No models available for the {role} role.[/yellow]")
+            return False
+        selected = _select_menu(f"Select a model for {role.title()}", options)
+        if selected is None:
+            return False
+        set_selected_model(config, provider, role, selected.id)
+        save_provider_config(session_name, config)
+        console.print(f"[green]{role.title()} model set to {selected.id}.[/green]")
+        return True
+    except (ProviderError, ValueError) as exc:
+        console.print(f"[red]Model selection failed: {exc}[/red]")
+        return False
+    finally:
+        if adapter:
+            await adapter.close()
+
+
+async def _provider_setup_menu(session_name: str, config: ProviderConfig) -> bool:
+    options = []
+    for provider in supported_providers():
+        marker = []
+        if provider in config.providers:
+            marker.append("configured")
+        if provider == config.active_provider:
+            marker.append("active")
+        suffix = f"  [{', '.join(marker)}]" if marker else ""
+        options.append((f"{provider}{suffix}", provider))
+    provider = _select_menu("Select a provider", options)
+    if provider is None:
+        return False
+    if not await _configure_provider(session_name, provider, config):
+        return False
+    await _select_role_model(session_name, config, "orchestrator")
+    await _select_role_model(session_name, config, "worker")
+    return True
+
+
+async def _session_setup_menu(session_name: str) -> bool:
+    config = load_provider_config(session_name)
+    complete = await _configuration_is_complete(session_name, config)
+    while True:
+        options = []
+        if complete:
+            options.append(("Continue with current settings", "continue"))
+        options.extend([
+            ("Change provider", "provider"),
+            ("Change Orchestrator model", "orchestrator"),
+            ("Change Worker model", "worker"),
+            ("View status", "status"),
+        ])
+        action = _select_menu("What would you like to do?", options)
+        if action is None:
+            return complete
+        if action == "continue":
+            return True
+        if action == "provider":
+            await _provider_setup_menu(session_name, config)
+        elif action in {"orchestrator", "worker"}:
+            await _select_role_model(session_name, config, action)
+        elif action == "status":
+            await handle_provider_command(session_name, ["/provider", "status"])
+        complete = await _configuration_is_complete(session_name, config)
+
+
+async def _startup_setup(session_name: str) -> bool:
+    config = load_provider_config(session_name)
+    if await _configuration_is_complete(session_name, config):
+        provider = config.active_provider
+        orchestrator_model, worker_model = selected_models(config, provider)
+        console.print(
+            f"[cyan]Active:[/cyan] {provider}  |  "
+            f"[cyan]Orchestrator:[/cyan] {orchestrator_model}  |  "
+            f"[cyan]Worker:[/cyan] {worker_model}"
+        )
+        choice = input("[Enter] Continue    [c] Change settings: ").strip().lower()
+        if choice != "c":
+            return True
+    return await _session_setup_menu(session_name)
+
 
 async def handle_undo(db_uri: str, session_name: str) -> None:
     stack = load_rollback_stack(session_name)
@@ -272,29 +586,31 @@ async def handle_undo(db_uri: str, session_name: str) -> None:
         save_rollback_stack(session_name, stack)
 
 async def handle_log(session_name: str) -> None:
-    stack = load_rollback_stack(session_name)
-    if not stack:
-        console.print("[yellow]No commits found in rollback stack for this session.[/yellow]")
+    history = load_query_history(session_name)
+    if not history:
+        console.print("[yellow]No queries found in history for this session.[/yellow]")
         return
-        
-    table = Table(title=f"Commit Log History (Session: {session_name})")
-    table.add_column("Commit Hash", style="yellow")
+
+    table = Table(title=f"Query History (Session: {session_name})")
+    table.add_column("Hash", style="yellow")
     table.add_column("Timestamp", style="cyan")
     table.add_column("Operation", style="green")
     table.add_column("Table", style="magenta")
     table.add_column("Rows", style="blue", justify="right")
+    table.add_column("Rollback", style="red")
     table.add_column("SQL Query", style="dim")
-    
-    for entry in reversed(stack):
+
+    for entry in reversed(history):
         table.add_row(
             entry.get("commit_hash", "N/A"),
             entry.get("timestamp", "N/A"),
             entry.get("operation", "N/A"),
             entry.get("table", "N/A"),
-            str(len(entry.get("before", []))),
-            entry.get("query", "N/A")
+            str(entry.get("rows_affected", 0)),
+            "yes" if entry.get("rollbackable") else "no",
+            entry.get("query", "N/A"),
         )
-        
+
     console.print(table)
 
 async def handle_revert(db_uri: str, session_name: str, target_hash: str) -> None:
@@ -306,7 +622,10 @@ async def handle_revert(db_uri: str, session_name: str, target_hash: str) -> Non
             break
             
     if target_idx == -1:
-        console.print(f"[red]Error: Commit hash '{target_hash}' not found in the stack.[/red]")
+        if any(entry.get("commit_hash") == target_hash for entry in load_query_history(session_name)):
+            console.print(f"[yellow]Hash '{target_hash}' is a read-only query and cannot be reverted. Use /undo for the latest mutation.[/yellow]")
+        else:
+            console.print(f"[red]Error: Hash '{target_hash}' not found in mutation history.[/red]")
         return
         
     commits_to_revert = stack[target_idx + 1:]
@@ -363,6 +682,9 @@ async def run_chat_loop(db_uri: str, session_name: str, mcp_session: ClientSessi
 
     init_session(session_name)
     chat_messages = load_chat_memory(session_name)
+    if not await _startup_setup(session_name):
+        console.print("[cyan]Session setup cancelled.[/cyan]")
+        return
     print_banner(db_uri, session_name)
 
     while True:
@@ -371,6 +693,13 @@ async def run_chat_loop(db_uri: str, session_name: str, mcp_session: ClientSessi
         
         if not user_query:
             continue
+
+        if user_query == "/":
+            command = _slash_command_menu()
+            if command:
+                user_query = command
+            else:
+                continue
             
         if user_query in ("/exit", "exit"):
             console.print("[cyan]Exiting db-agent session. Goodbye![/cyan]")
@@ -390,6 +719,10 @@ async def run_chat_loop(db_uri: str, session_name: str, mcp_session: ClientSessi
                 console.print("[red]Error: Please specify a commit hash (e.g., /revert abc12345)[/red]")
             else:
                 await handle_revert(db_uri, session_name, parts[1])
+            continue
+
+        elif user_query == "/providers":
+            await _session_setup_menu(session_name)
             continue
 
         elif user_query.startswith("/provider"):
@@ -486,6 +819,31 @@ def get_char() -> str:
     finally:
         termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
 
+def _delete_session_with_confirmation(session_name: str) -> bool:
+    confirm = input(f"\nAre you sure you want to delete session '{session_name}'? (y/n): ").strip().lower()
+    if confirm not in ("y", "yes"):
+        console.print("[yellow]Deletion cancelled.[/yellow]")
+        return False
+    try:
+        shutil.rmtree(get_session_dir(session_name))
+        console.print(f"[green]Deleted session '{session_name}' successfully.[/green]")
+        return True
+    except FileNotFoundError:
+        console.print(f"[yellow]Session '{session_name}' was already absent.[/yellow]")
+    except OSError as exc:
+        console.print(f"[red]Error deleting session folder: {exc}[/red]")
+    return False
+
+
+def _choose_session_to_delete() -> str | None:
+    sessions = get_all_sessions()
+    if not sessions:
+        console.print("[yellow]No sessions available to delete.[/yellow]")
+        return None
+    options = [(f"{session['name']} (DB: {session['db_uri']})", session["name"]) for session in sessions]
+    return _select_menu("Select a session to delete", options)
+
+
 def interactive_session_menu() -> tuple[str, str] | None:
     console.print(Panel("[bold cyan]Welcome to db-agent CLI[/bold cyan]", border_style="cyan", expand=False))
     
@@ -510,6 +868,15 @@ def interactive_session_menu() -> tuple[str, str] | None:
         })
         menu_options.append({
             "is_new": False,
+            "is_delete": True,
+            "is_exit": False,
+            "name": "",
+            "db_uri": "",
+            "last_active": ""
+        })
+        menu_options.append({
+            "is_new": False,
+            "is_delete": False,
             "is_exit": True,
             "name": "",
             "db_uri": "",
@@ -518,20 +885,25 @@ def interactive_session_menu() -> tuple[str, str] | None:
         
         selected_idx = 0
         
-        def print_menu():
+        def print_menu(move_up: bool = False):
+            if move_up:
+                sys.stdout.write(f"\033[{max(0, len(menu_options) - 1)}A\033[1G\033[J")
             for i, opt in enumerate(menu_options):
                 marker = ">" if i == selected_idx else " "
-                style = "[bold cyan]" if i == selected_idx else ""
-                end_style = "[/bold cyan]" if i == selected_idx else ""
-                
                 if opt.get("is_new"):
-                    line = f" {marker} {style}Start a new session{end_style}"
+                    line = f" {marker} Start a new session"
+                elif opt.get("is_delete"):
+                    line = f" {marker} Delete a session"
                 elif opt.get("is_exit"):
-                    line = f" {marker} {style}Exit db-agent{end_style}"
+                    line = f" {marker} Exit db-agent"
                 else:
-                    line = f" {marker} {style}{opt['name']} (DB: {opt['db_uri']}) - Active: {opt['last_active']}{end_style}"
-                
-                console.print(f"\r\x1b[K{line}", end="\n")
+                    line = f" {marker} {opt['name']} (DB: {opt['db_uri']}) - Active: {opt['last_active']}"
+                if i == selected_idx:
+                    line = f"\033[1;36m{line}\033[0m"
+                sys.stdout.write(line)
+                if i < len(menu_options) - 1:
+                    sys.stdout.write("\n")
+            sys.stdout.flush()
                 
         console.print("\n[bold]Arrow keys (Up/Down) to choose, 'd' to delete selected, Enter to select:[/bold]")
         print_menu()
@@ -541,30 +913,23 @@ def interactive_session_menu() -> tuple[str, str] | None:
             if char == '\x1b[A':
                 if selected_idx > 0:
                     selected_idx -= 1
-                    sys.stdout.write(f"\x1b[{len(menu_options)}A")
-                    print_menu()
+                    print_menu(move_up=True)
             elif char == '\x1b[B':
                 if selected_idx < len(menu_options) - 1:
                     selected_idx += 1
-                    sys.stdout.write(f"\x1b[{len(menu_options)}A")
-                    print_menu()
+                    print_menu(move_up=True)
             elif char in ('d', 'D'):
                 opt = menu_options[selected_idx]
-                if not opt["is_new"] and not opt.get("is_exit"):
-                    session_to_delete = opt["name"]
-                    confirm = input(f"\nAre you sure you want to delete session '{session_to_delete}'? (y/n): ").strip().lower()
-                    if confirm in ('y', 'yes'):
-                        from db_agent.tracker import get_session_dir
-                        session_dir = get_session_dir(session_to_delete)
-                        try:
-                            shutil.rmtree(session_dir)
-                            console.print(f"[green]Deleted session '{session_to_delete}' successfully.[/green]")
-                        except Exception as e:
-                            console.print(f"[red]Error deleting session folder: {str(e)}[/red]")
-                    else:
-                        console.print("[yellow]Deletion cancelled.[/yellow]")
+                if not opt["is_new"] and not opt.get("is_delete") and not opt.get("is_exit"):
+                    _delete_session_with_confirmation(opt["name"])
                     break
             elif char in ('\r', '\n'):
+                selected_opt = menu_options[selected_idx]
+                if selected_opt.get("is_delete"):
+                    session_to_delete = _choose_session_to_delete()
+                    if session_to_delete:
+                        _delete_session_with_confirmation(session_to_delete)
+                    break
                 selected_opt = menu_options[selected_idx]
                 if selected_opt.get("is_exit"):
                     return None

@@ -3,7 +3,7 @@ import json
 import re
 from mcp.server.fastmcp import FastMCP
 from sqlalchemy import create_engine, text, inspect
-from db_agent.tracker import add_rollback_entry
+from db_agent.tracker import add_query_history_entry, add_rollback_entry
 
 mcp = FastMCP("DB_Core")
 
@@ -57,8 +57,16 @@ def read_query(sql_query: str) -> str:
         engine = get_engine()
         with engine.connect() as conn:
             result = conn.execute(text(sql_query))
+            rows = [dict(row._mapping) for row in result.all()] if result.returns_rows else []
+            add_query_history_entry(
+                os.environ.get("SESSION_NAME", "default"),
+                "SELECT",
+                "query",
+                sql_query,
+                len(rows),
+                rollbackable=False,
+            )
             if result.returns_rows:
-                rows = [dict(row._mapping) for row in result.all()]
                 return json.dumps(rows, default=str, indent=2)
             return "Query executed successfully, but returned no rows."
     except Exception as e:

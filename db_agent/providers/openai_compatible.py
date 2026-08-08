@@ -52,7 +52,7 @@ class OpenAICompatibleAdapter(ProviderAdapter):
                 metadata = value
             if not model_id:
                 continue
-            if not self.include_all_models and self._is_non_generation_model(str(model_id)):
+            if self._is_non_generation_model(str(model_id), metadata):
                 continue
             models.append(self._model_info(str(model_id), metadata))
         return models
@@ -69,21 +69,27 @@ class OpenAICompatibleAdapter(ProviderAdapter):
         if supports_tools is None and isinstance(architecture, dict):
             supports_tools = architecture.get("supports_tools")
         supports_thinking = metadata.get("supports_thinking")
+        supports_chat = metadata.get("supports_chat")
+        modality = metadata.get("modality") or metadata.get("type")
         return ModelInfo(
             id=model_id,
             display_name=str(metadata.get("name") or metadata.get("display_name") or model_id),
             context_window=int(context) if isinstance(context, (int, float)) else None,
             supports_tools=supports_tools,
             supports_thinking=supports_thinking,
+            supports_chat=supports_chat,
+            modality=str(modality) if modality else None,
         )
 
     @staticmethod
-    def _is_non_generation_model(model_id: str) -> bool:
+    def _is_non_generation_model(model_id: str, metadata: dict[str, Any]) -> bool:
         lowered = model_id.lower()
-        return any(
-            marker in lowered
-            for marker in ("embedding", "moderation", "whisper", "tts", "dall-e")
-        )
+        modality = str(metadata.get("modality") or metadata.get("type") or "").lower()
+        architecture = metadata.get("architecture") or {}
+        architecture_text = " ".join(str(value) for value in architecture.values()) if isinstance(architecture, dict) else str(architecture)
+        metadata_text = f"{modality} {architecture_text}".lower()
+        markers = ("embedding", "moderation", "whisper", "tts", "dall-e", "audio", "vision-only", "image-only")
+        return any(marker in lowered or marker in metadata_text for marker in markers)
 
     async def generate(
         self,

@@ -1,3 +1,4 @@
+import copy
 import json
 import re
 from typing import Any
@@ -72,11 +73,19 @@ async def execute_task(
     valid_tool_names = set()
     for tool in mcp_tools.tools:
         valid_tool_names.add(tool.name)
+        parameters = copy.deepcopy(tool.inputSchema)
+        if tool.name == "execute_smart_mutation":
+            properties = parameters.get("properties")
+            if isinstance(properties, dict):
+                properties.pop("commit_group_id", None)
+            required = parameters.get("required")
+            if isinstance(required, list):
+                parameters["required"] = [name for name in required if name != "commit_group_id"]
         provider_tools.append(
             {
                 "name": tool.name,
                 "description": tool.description,
-                "parameters": tool.inputSchema,
+                "parameters": parameters,
             }
         )
 

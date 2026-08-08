@@ -4,7 +4,6 @@ from db_agent.providers.openai_compatible import OpenAICompatibleAdapter
 
 class OpenRouterAdapter(OpenAICompatibleAdapter):
     name = "openrouter"
-    include_all_models = True
 
     def __init__(self, api_key: str | None, base_url: str | None = None, *, client=None):
         super().__init__(api_key, base_url or "https://openrouter.ai/api/v1", client=client)

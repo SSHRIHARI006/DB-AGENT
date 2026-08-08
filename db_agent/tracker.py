@@ -21,6 +21,29 @@ def init_session(session_name: str) -> None:
     if not os.path.exists(rollback_stack_path):
         with open(rollback_stack_path, "w", encoding="utf-8") as f:
             json.dump([], f, indent=2)
+
+    query_history_path = os.path.join(session_dir, "query_history.json")
+    if not os.path.exists(query_history_path):
+        try:
+            with open(rollback_stack_path, "r", encoding="utf-8") as f:
+                rollback_entries = json.load(f)
+        except (OSError, ValueError, TypeError):
+            rollback_entries = []
+        history_entries = [
+            {
+                "commit_hash": entry.get("commit_hash"),
+                "commit_group_id": entry.get("commit_group_id"),
+                "timestamp": entry.get("timestamp"),
+                "operation": entry.get("operation", "MUTATION"),
+                "table": entry.get("table", "N/A"),
+                "query": entry.get("query", ""),
+                "rows_affected": len(entry.get("before", [])),
+                "rollbackable": True,
+            }
+            for entry in rollback_entries
+        ]
+        with open(query_history_path, "w", encoding="utf-8") as f:
+            json.dump(history_entries, f, indent=2)
             
     history_md_path = os.path.join(session_dir, "DB_HISTORY.md")
     if not os.path.exists(history_md_path):
@@ -57,6 +80,52 @@ def save_rollback_stack(session_name: str, stack: List[Dict[str, Any]]) -> None:
     with open(rollback_stack_path, "w", encoding="utf-8") as f:
         json.dump(stack, f, indent=2)
 
+def load_query_history(session_name: str) -> List[Dict[str, Any]]:
+    init_session(session_name)
+    history_path = os.path.join(get_session_dir(session_name), "query_history.json")
+    try:
+        with open(history_path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except (OSError, ValueError, TypeError):
+        return []
+
+
+def save_query_history(session_name: str, history: List[Dict[str, Any]]) -> None:
+    history_path = os.path.join(get_session_dir(session_name), "query_history.json")
+    with open(history_path, "w", encoding="utf-8") as f:
+        json.dump(history, f, indent=2)
+
+
+def add_query_history_entry(
+    session_name: str,
+    operation: str,
+    table: str,
+    query: str,
+    rows_affected: int = 0,
+    *,
+    commit_hash: str | None = None,
+    commit_group_id: str | None = None,
+    rollbackable: bool = False,
+) -> str:
+    init_session(session_name)
+    history = load_query_history(session_name)
+    query_hash = commit_hash or secrets.token_hex(4)
+    entry = {
+        "commit_hash": query_hash,
+        "commit_group_id": commit_group_id,
+        "timestamp": datetime.datetime.now().isoformat(),
+        "operation": operation.upper(),
+        "table": table,
+        "query": query,
+        "rows_affected": rows_affected,
+        "rollbackable": rollbackable,
+    }
+    history.append(entry)
+    save_query_history(session_name, history)
+    append_history_log(session_name, query_hash, operation, table, query, rows_affected, commit_group_id)
+    return query_hash
+
+
 def add_rollback_entry(
     session_name: str,
     operation: str,
@@ -86,7 +155,16 @@ def add_rollback_entry(
     stack.append(entry)
     save_rollback_stack(session_name, stack)
     
-    append_history_log(session_name, commit_hash, operation, table, query, len(before), commit_group_id)
+    add_query_history_entry(
+        session_name,
+        operation,
+        table,
+        query,
+        len(before),
+        commit_hash=commit_hash,
+        commit_group_id=commit_group_id or commit_hash,
+        rollbackable=True,
+    )
     
     return commit_hash
 
