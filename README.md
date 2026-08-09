@@ -36,13 +36,15 @@ Keys entered at the prompt are held only in process memory and are never written
 
 ## Setup
 
+### Linux and macOS
+
 ```bash
 git clone https://github.com/SSHRIHARI006/DB-AGENT.git db-agent
 cd db-agent
 python3 install.py
 ```
 
-The installer does not install or pull local Ollama models. It reuses an existing `.venv` when present, installs the pinned MCP-compatible dependencies, and verifies the FastMCP import before completing.
+The installer does not install or pull local Ollama models. It reuses an existing `.venv` when present, installs the dependency ranges declared in `pyproject.toml`, and verifies the FastMCP import before completing.
 
 You can launch with either:
 
@@ -56,7 +58,49 @@ or, after installation:
 ~/.local/bin/db-agent sqlite:///test.db --session my_project
 ```
 
-Start a session directly:
+### Windows setup
+
+Run these commands in PowerShell. Python 3.12 or newer is required.
+
+```powershell
+git clone https://github.com/SSHRIHARI006/DB-AGENT.git db-agent
+cd db-agent
+py -3.12 install.py
+```
+
+If the `py` launcher is unavailable, run `python install.py` instead. After setup, activate the virtual environment in PowerShell with:
+
+```powershell
+.\.venv\Scripts\Activate.ps1
+```
+
+In Command Prompt, use:
+
+```bat
+.venv\Scripts\activate.bat
+```
+
+You can also run without activating the environment:
+
+```powershell
+.\.venv\Scripts\db-agent.exe sqlite:///test.db --session my_project
+```
+
+or:
+
+```powershell
+.\.venv\Scripts\python.exe -m db_agent.cli sqlite:///test.db --session my_project
+```
+
+For an absolute Windows SQLite path, use forward slashes in the SQLAlchemy URI, for example `sqlite:///C:/Users/you/db-agent/test.db`. The root `db-agent` launcher and `setup.sh` are Unix helpers; use the commands above on Windows.
+
+To run the test suite on Windows:
+
+```powershell
+.\.venv\Scripts\python.exe -m pytest
+```
+
+Start a session directly on Unix-like systems with:
 
 ```bash
 ./db-agent sqlite:///test.db --session my_project

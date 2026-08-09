@@ -51,8 +51,10 @@ def main() -> None:
     print(" Setup complete!")
     print(f" Virtual environment: {venv_dir}")
     if system == "windows":
-        print(f" Activate with: {venv_dir}\\Scripts\\activate")
-        print(" Then run: db-agent")
+        print(f" PowerShell activation: .\\.venv\\Scripts\\Activate.ps1")
+        print(f" Command Prompt activation: .venv\\Scripts\\activate.bat")
+        print(f" Run without activation: .\\.venv\\Scripts\\db-agent.exe")
+        print(f" Or run: .\\.venv\\Scripts\\python.exe -m db_agent.cli")
     else:
         local_bin = os.path.expanduser("~/.local/bin")
         os.makedirs(local_bin, exist_ok=True)

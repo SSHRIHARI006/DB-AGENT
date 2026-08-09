@@ -5,9 +5,13 @@ import asyncio
 import json
 import re
 import secrets
-import tty
-import termios
 import shutil
+
+if os.name == "nt":
+    import msvcrt
+else:
+    import tty
+    import termios
 import datetime
 from typing import List, Dict, Any
 
@@ -806,12 +810,19 @@ async def run_chat_loop(db_uri: str, session_name: str, mcp_session: ClientSessi
         await adapter.close()
 
 def get_char() -> str:
+    if os.name == "nt":
+        char = msvcrt.getwch()
+        if char in ("\x00", "\xe0"):
+            extended_char = msvcrt.getwch()
+            return {"H": "\x1b[A", "P": "\x1b[B"}.get(extended_char, extended_char)
+        return char
+
     fd = sys.stdin.fileno()
     old_settings = termios.tcgetattr(fd)
     try:
         tty.setraw(sys.stdin.fileno())
         ch = sys.stdin.read(1)
-        if ch == '\x1b':
+        if ch == "\x1b":
             ch2 = sys.stdin.read(1)
             ch3 = sys.stdin.read(1)
             return ch + ch2 + ch3

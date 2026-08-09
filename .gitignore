@@ -51,4 +51,7 @@ populate_db.py
 # Documentation / Specs
 Technical Specification.md
 
-tests
+# Keep Windows compatibility tests tracked
+tests/*
+!tests/test_cli_platform.py
+!tests/test_install.py
