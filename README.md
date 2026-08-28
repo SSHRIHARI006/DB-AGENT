@@ -146,6 +146,24 @@ setup), and the human-in-the-loop gate is structurally non-bypassable: there
 is no auto-approve flag in the web code path, and a risky mutation always
 stops for an explicit **Approve and execute** click.
 
+Demo-mode extras:
+
+- **Schema panel** — the sidebar shows every table, column, and type, fetched
+  once per browser session (reuses the same reflection used for the
+  orchestrator's prompt context).
+- **Pinned cheap models** — both the Orchestrator and Worker are fixed
+  constants (`db_agent/demo_config.py`), never resolved from `/models list` at
+  request time.
+- **Key rotation** — set `DEMO_<PROVIDER>_KEYS=key1,key2,...` in `.env` to
+  spread traffic round-robin across keys per query (falls back to the
+  single-key env var). In-memory only; no cross-restart state.
+- **DB change diff** — after an INSERT/UPDATE/DELETE the UI shows a
+  before/after comparison built from the rollback stack's captured rows.
+  SELECT queries show only their result.
+- **Undo / Revert** — a rollback-history panel lists recent commits with
+  **Undo last** and per-entry **Revert to here**. Both go through the same
+  confirm-click gate as any other mutation.
+
 ## Provider and model commands
 
 Inside the session:
