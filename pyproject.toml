@@ -29,3 +29,6 @@ web = [
 
 [project.scripts]
 db-agent = "db_agent.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["db_agent*"]

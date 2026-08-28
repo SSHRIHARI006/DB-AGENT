@@ -7,15 +7,20 @@ services:
       - .env
     volumes:
       - db_agent_data:/app/.db_agent
-    ports:
-      - "127.0.0.1:8501:8501"   # bind to localhost only — the existing reverse proxy handles
-                                # external exposure and TLS, so this container should never be
-                                # reachable directly from the public internet
+    # No host ports published: the container joins the shared web_network and
+    # is reached by Caddy (production_proxy) over Docker DNS as db-agent:8501.
+    networks:
+      - web_network
     healthcheck:
-      test: ["CMD-SHELL", "curl -f http://localhost:8501/_stcore/health || exit 1"]
+      # python:3.12-slim ships no curl/wget, so probe with urllib.
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8501/_stcore/health', timeout=5)"]
       interval: 30s
       timeout: 5s
       retries: 3
 
 volumes:
   db_agent_data:
+
+networks:
+  web_network:
+    external: true
