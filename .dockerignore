@@ -1,0 +1,10 @@
+.venv/
+.db_agent/
+.env
+.env.*
+test.db
+__pycache__/
+*.pyc
+.specs/
+.git/
+.pytest_cache/

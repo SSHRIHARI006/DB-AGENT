@@ -1,17 +1,31 @@
 import os
 import json
-import re
 from mcp.server.fastmcp import FastMCP
 from sqlalchemy import create_engine, text, inspect
-from db_agent.tracker import add_query_history_entry, add_rollback_entry
+from db_agent.guardrails import (
+    classify_statement,
+    is_safe_read_query,
+    validate_table_identifier,
+    validate_where_condition,
+)
+from db_agent.tracker import (
+    add_query_history_entry,
+    build_rollback_entry,
+    persist_rollback_entry,
+)
 
 mcp = FastMCP("DB_Core")
 
-def get_engine():
-    db_uri = os.environ.get("DYNAMIC_DB_URI")
+def get_engine(db_uri: str | None = None):
+    db_uri = db_uri or os.environ.get("DYNAMIC_DB_URI")
     if not db_uri:
-        raise ValueError("DYNAMIC_DB_URI environment variable is not set.")
+        raise ValueError("No database URI provided and DYNAMIC_DB_URI environment variable is not set.")
     return create_engine(db_uri)
+
+
+def conn_quoted_table(engine, table_name: str) -> str:
+    """Quote an identifier with the dialect's preparer instead of splicing it raw."""
+    return engine.dialect.identifier_preparer.quote(table_name)
 
 @mcp.resource("schema://current")
 def get_schema() -> str:
@@ -46,13 +60,10 @@ def get_schema() -> str:
 
 @mcp.tool()
 def read_query(sql_query: str) -> str:
-    upper_query = sql_query.strip().upper()
-    
-    forbidden = ["INSERT", "UPDATE", "DELETE", "DROP", "ALTER", "CREATE", "RENAME", "TRUNCATE", "REPLACE"]
-    for word in forbidden:
-        if re.search(rf"\b{word}\b", upper_query):
-            return f"Error: The query contains a mutating keyword '{word}'. Only read-only queries are allowed."
-            
+    ok, reason = is_safe_read_query(sql_query)
+    if not ok:
+        return f"Error: {reason}"
+
     try:
         engine = get_engine()
         with engine.connect() as conn:
@@ -73,72 +84,89 @@ def read_query(sql_query: str) -> str:
         return f"Error executing read query: {str(e)}"
 
 @mcp.tool()
-def execute_smart_mutation(table_name: str, sql_query: str, where_condition: str, commit_group_id: str = None) -> str:
-    upper_query = sql_query.strip().upper()
-    
-    if "DROP" in upper_query or "ALTER" in upper_query:
+def execute_smart_mutation(
+    table_name: str,
+    sql_query: str,
+    where_condition: str,
+    commit_group_id: str = None,
+    approved_via: str = "manual",
+) -> str:
+    operation = classify_statement(sql_query)
+
+    if operation == "DDL":
         return "Error: Structural database modifications (DDL) are blocked by this agent."
-        
-    operation = None
-    if "INSERT" in upper_query:
-        operation = "INSERT"
-    elif "UPDATE" in upper_query:
-        operation = "UPDATE"
-    elif "DELETE" in upper_query:
-        operation = "DELETE"
-        
-    if not operation:
+
+    if operation not in ("INSERT", "UPDATE", "DELETE"):
         return "Error: Could not identify operation type (INSERT, UPDATE, DELETE) in the query."
-        
+
     session_name = os.environ.get("SESSION_NAME", "default")
-    
+
     try:
         engine = get_engine()
         is_sqlite = engine.dialect.name == "sqlite"
-        
         inspector = inspect(engine)
+
+        table_ok, table_reason = validate_table_identifier(table_name, inspector)
+        if not table_ok:
+            return f"Error: {table_reason}"
+
+        where_ok, where_reason = validate_where_condition(where_condition or "")
+        if not where_ok:
+            return f"Error: {where_reason}"
+
+        if operation == "INSERT" and not (where_condition or "").strip():
+            return (
+                "Error: INSERT rollback capture requires a non-empty where_condition so /undo "
+                "can target exactly the inserted row. Refusing to snapshot the whole table."
+            )
+
         pk_constraint = inspector.get_pk_constraint(table_name)
         primary_keys = pk_constraint.get("constrained_columns", []) if pk_constraint else []
-        
+
         before_rows = []
-        
+        quoted_table = conn_quoted_table(engine, table_name)
+
         with engine.begin() as conn:
             if operation in ("UPDATE", "DELETE"):
                 where_clause = f" WHERE {where_condition}" if where_condition.strip() else ""
                 lock_clause = "" if is_sqlite else " FOR UPDATE"
-                snapshot_sql = f"SELECT * FROM {table_name}{where_clause}{lock_clause}"
-                
+                snapshot_sql = f"SELECT * FROM {quoted_table}{where_clause}{lock_clause}"
+
                 snapshot_result = conn.execute(text(snapshot_sql))
                 before_rows = [dict(row._mapping) for row in snapshot_result.all()]
-                
+
             result = conn.execute(text(sql_query))
-            
+
             if operation == "INSERT":
                 where_clause = f" WHERE {where_condition}" if where_condition.strip() else ""
-                snapshot_sql = f"SELECT * FROM {table_name}{where_clause}"
-                
+                snapshot_sql = f"SELECT * FROM {quoted_table}{where_clause}"
+
                 snapshot_result = conn.execute(text(snapshot_sql))
                 before_rows = [dict(row._mapping) for row in snapshot_result.all()]
-                
-        commit_hash = add_rollback_entry(
-            session_name=session_name,
-            operation=operation,
-            table=table_name,
-            query=sql_query,
-            before=before_rows,
-            primary_keys=primary_keys,
-            commit_group_id=commit_group_id
-        )
-        
+
+            # Write the rollback entry inside the transaction: a JSON write
+            # failure here raises and rolls back the DB commit, so we never
+            # leave a committed mutation with no rollback record.
+            entry = build_rollback_entry(
+                operation=operation,
+                table=table_name,
+                query=sql_query,
+                before=before_rows,
+                primary_keys=primary_keys,
+                commit_group_id=commit_group_id,
+                approved_via=approved_via,
+            )
+            commit_hash = persist_rollback_entry(session_name, entry)
+
         return json.dumps({
             "status": "success",
             "commit_hash": commit_hash,
             "operation": operation,
             "table": table_name,
             "rows_affected": len(before_rows),
-            "message": f"Mutation completed successfully with commit hash {commit_hash}."
+            "message": f"Mutation completed successfully with commit hash {commit_hash}.",
         }, indent=2)
-        
+
     except Exception as e:
         return json.dumps({
             "status": "error",

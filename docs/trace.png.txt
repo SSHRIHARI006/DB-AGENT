@@ -1,0 +1,14 @@
+# Trace screenshot placeholder
+
+The README references `docs/trace.png` — a real Langfuse trace of the agent
+loop. To produce it:
+
+1. Set `LANGFUSE_PUBLIC_KEY` / `LANGFUSE_SECRET_KEY` (and optionally
+   `LANGFUSE_HOST`) in `.env`.
+2. Run one natural-language query through the CLI or web demo.
+3. Open the trace in Langfuse — it should show nested spans:
+   `orchestrator.plan_dag` → `worker.execute_task` (per DAG task) →
+   `gate.decision` (for risky mutations) → final tool result.
+4. Screenshot it and save it here as `trace.png`.
+
+Until then, the image in the README will not render.

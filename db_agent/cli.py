@@ -2,7 +2,6 @@ import os
 import sys
 import argparse
 import asyncio
-import json
 import re
 import secrets
 import shutil
@@ -13,7 +12,7 @@ else:
     import tty
     import termios
 import datetime
-from typing import List, Dict, Any
+from typing import Any
 
 from sqlalchemy import create_engine, text
 from mcp import ClientSession, StdioServerParameters
@@ -25,6 +24,8 @@ from rich.markdown import Markdown
 from rich.table import Table
 
 from db_agent.env_loader import load_dotenv
+from db_agent.gate import GateDecision
+from db_agent.guardrails import classify_risk, classify_statement
 from db_agent.tracker import (
     init_session,
     load_chat_memory,
@@ -34,7 +35,6 @@ from db_agent.tracker import (
     save_rollback_stack,
     generate_inverse_queries,
     save_session_config,
-    load_session_config,
     get_all_sessions,
     get_session_dir,
 )
@@ -57,8 +57,6 @@ from db_agent.providers import (
     create_adapter,
     supported_providers,
 )
-from db_agent.providers.factory import PROVIDER_ENV_VARS
-from db_agent.providers.static_models import STATIC_MODELS
 
 ROLE_LABELS = {"orchestrator": "Orchestrator", "worker": "Worker"}
 
@@ -199,6 +197,57 @@ def _provider_config_or_error(session_name: str) -> ProviderConfig | None:
         console.print("[yellow]No active provider. Use /provider set <name> first.[/yellow]")
         return None
     return config
+
+
+_AUTO_APPROVE = False
+
+
+def set_auto_approve(enabled: bool) -> None:
+    global _AUTO_APPROVE
+    _AUTO_APPROVE = enabled
+
+
+async def _cli_gate(tool_name: str, args: dict[str, Any]) -> GateDecision:
+    """Human-in-the-loop gate hook for the CLI.
+
+    Only ``execute_smart_mutation`` is gated. Risky mutations render a Rich
+    confirmation panel; ``--yes``/``/auto-approve`` skips the prompt but the
+    decision is still stamped ``approved_via="auto_flag"`` so the audit trail
+    can distinguish a reviewed risky delete from an unattended one.
+    """
+    if tool_name != "execute_smart_mutation":
+        return GateDecision.approve()
+
+    sql_query = str(args.get("sql_query", ""))
+    table_name = str(args.get("table_name", ""))
+    where_condition = str(args.get("where_condition", "") or "")
+
+    operation = classify_statement(sql_query)
+    risk = classify_risk(operation, where_condition, table=table_name)
+
+    if not risk.risky:
+        return GateDecision.approve()
+
+    panel = Panel(
+        Markdown(
+            f"**Operation:** `{operation}`\n"
+            f"**Table:** `{table_name}`\n"
+            f"**Reason:** {risk.reason}\n\n"
+            f"**SQL:**\n```sql\n{sql_query}\n```"
+        ),
+        title="[bold red]Risky mutation — confirm[/bold red]",
+        border_style="red",
+    )
+    console.print(panel)
+
+    if _AUTO_APPROVE:
+        console.print("[yellow]Auto-approve is on — approving without a prompt (stamped auto_flag).[/yellow]")
+        return GateDecision.approve(approved_via="auto_flag", message=risk.reason)
+
+    choice = input("Proceed? [y/N]: ").strip().lower()
+    if choice in ("y", "yes"):
+        return GateDecision.approve(approved_via="manual", message=risk.reason)
+    return GateDecision.deny_abort(f"Aborted by user: {risk.reason}")
 
 
 def _model_label(model) -> str:
@@ -651,35 +700,6 @@ async def handle_revert(db_uri: str, session_name: str, target_hash: str) -> Non
     except Exception as e:
         console.print(f"[red]Error executing revert: {str(e)}[/red]")
 
-def parse_fallback_tool_calls(content: str) -> List[Dict[str, Any]]:
-    if not content:
-        return []
-    tool_calls = []
-    blocks = re.findall(r"```(?:json)?\s*(\{.*?\})\s*```", content, re.DOTALL)
-    for block in blocks:
-        try:
-            data = json.loads(block.strip())
-            if isinstance(data, dict) and "name" in data and "arguments" in data:
-                tool_calls.append(data)
-        except Exception:
-            pass
-    if not tool_calls:
-        try:
-            data = json.loads(content.strip())
-            if isinstance(data, dict) and "name" in data and "arguments" in data:
-                tool_calls.append(data)
-        except Exception:
-            pass
-    if not tool_calls:
-        matches = re.finditer(r"\{\s*\"name\"\s*:\s*\"[^\"]+\"\s*,\s*\"arguments\"\s*:\s*\{.*?\}\s*\}", content, re.DOTALL)
-        for match in matches:
-            try:
-                data = json.loads(match.group(0))
-                tool_calls.append(data)
-            except Exception:
-                pass
-    return tool_calls
-
 async def run_chat_loop(db_uri: str, session_name: str, mcp_session: ClientSession):
     from db_agent.agents.orchestrator import plan_dag
     from db_agent.agents.worker import execute_task
@@ -690,6 +710,8 @@ async def run_chat_loop(db_uri: str, session_name: str, mcp_session: ClientSessi
         console.print("[cyan]Session setup cancelled.[/cyan]")
         return
     print_banner(db_uri, session_name)
+    if _AUTO_APPROVE:
+        console.print("[yellow]Auto-approve is ON — risky mutations will not prompt for confirmation.[/yellow]")
 
     while True:
         user_query = await asyncio.get_event_loop().run_in_executor(None, get_user_input)
@@ -783,7 +805,15 @@ async def run_chat_loop(db_uri: str, session_name: str, mcp_session: ClientSessi
                 
             async def run_worker(task):
                 console.print(f"[yellow]Running Task {task['id']}: {task.get('intent')}[/yellow]")
-                result = await execute_task(task, schema_text, group_id, mcp_session, adapter, worker_model)
+                result = await execute_task(
+                    task,
+                    schema_text,
+                    group_id,
+                    mcp_session,
+                    adapter,
+                    worker_model,
+                    pre_execute_hook=_cli_gate,
+                )
                 if result["status"] == "success":
                     console.print(f"[green]Task {task['id']} completed.[/green]")
                 else:
@@ -971,8 +1001,16 @@ async def run_cli():
     parser = argparse.ArgumentParser(description="db-agent: Autonomous CLI Database Assistant")
     parser.add_argument("db_uri", nargs="?", help="SQL Connection URI (e.g. sqlite:///test.db)")
     parser.add_argument("--session", default=None, help="Session name for workspace isolation")
+    parser.add_argument(
+        "--yes",
+        action="store_true",
+        help="Auto-approve risky mutations without prompting. "
+        "Approvals are stamped approved_via='auto_flag' in the audit trail.",
+    )
     args = parser.parse_args()
-    
+
+    set_auto_approve(args.yes)
+
     db_uri = args.db_uri
     session_name = args.session
     is_interactive = not db_uri

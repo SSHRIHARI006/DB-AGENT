@@ -1,0 +1,21 @@
+services:
+  db-agent:
+    build: .
+    container_name: db-agent-web
+    restart: unless-stopped
+    env_file:
+      - .env
+    volumes:
+      - db_agent_data:/app/.db_agent
+    ports:
+      - "127.0.0.1:8501:8501"   # bind to localhost only — the existing reverse proxy handles
+                                # external exposure and TLS, so this container should never be
+                                # reachable directly from the public internet
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:8501/_stcore/health || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+volumes:
+  db_agent_data:

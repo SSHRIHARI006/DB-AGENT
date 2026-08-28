@@ -2,6 +2,7 @@ import json
 from typing import Any
 
 from db_agent.providers import ProviderAdapter
+from db_agent.tracing import span
 
 
 async def plan_dag(
@@ -10,7 +11,12 @@ async def plan_dag(
     adapter: ProviderAdapter,
     model: str,
 ) -> list[dict[str, Any]]:
-    prompt = f"""You are a database query orchestrator. Your job is to break down complex natural language database requests into a JSON array of atomic operations.
+    with span(
+        "orchestrator.plan_dag",
+        input={"query": user_query},
+        metadata={"model": model},
+    ) as obs:
+        prompt = f"""You are a database query orchestrator. Your job is to break down complex natural language database requests into a JSON array of atomic operations.
 Each operation must represent a single atomic intent (e.g., read data, insert one record, update one record, delete one record).
 
 Current Database Schema:
@@ -27,16 +33,19 @@ Rules:
 
 User Request: {user_query}
 """
-    try:
-        result = await adapter.generate(
-            prompt=prompt,
-            model=model,
-            temperature=0.1,
-            response_format="json",
-        )
-        dag = json.loads(result.text)
-        if not isinstance(dag, list):
-            dag = [dag]
-        return dag
-    except Exception:
-        return [{"id": 1, "intent": user_query, "depends_on": []}]
+        try:
+            result = await adapter.generate(
+                prompt=prompt,
+                model=model,
+                temperature=0.1,
+                response_format="json",
+            )
+            dag = json.loads(result.text)
+            if not isinstance(dag, list):
+                dag = [dag]
+            obs.end(output={"task_count": len(dag), "tasks": dag})
+            return dag
+        except Exception:
+            fallback = [{"id": 1, "intent": user_query, "depends_on": []}]
+            obs.end(output={"task_count": 1, "tasks": fallback, "fallback": True})
+            return fallback
