@@ -9,11 +9,12 @@ import sqlite3
 import pytest
 
 from db_agent.demo_config import (
-    DEMO_ORCHESTRATOR_MODEL,
-    DEMO_WORKER_MODEL,
-    _new_rotator,
+    MODELS_PER_PROVIDER,
+    build_endpoint_pool,
     demo_api_keys,
     make_key_rotator,
+    next_demo_endpoint,
+    _new_rotator,
 )
 from db_agent.gate import GateDecision
 
@@ -53,19 +54,69 @@ def test_demo_keys_returns_empty_when_unset(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
-# Section 3 — pinned demo models
+# Section 3 — rotating demo endpoints
 # ---------------------------------------------------------------------------
 
 
-def test_demo_models_are_fixed_constants():
-    assert isinstance(DEMO_ORCHESTRATOR_MODEL, str)
-    assert isinstance(DEMO_WORKER_MODEL, str)
-    assert DEMO_ORCHESTRATOR_MODEL
-    assert DEMO_WORKER_MODEL
-    # The worker must be tool-capable — a pinned constant, never resolved
-    # from the live catalog at request time.
-    assert DEMO_WORKER_MODEL == "llama-3.1-8b-instant"
-    assert DEMO_ORCHESTRATOR_MODEL == "llama-3.1-8b-instant"
+def test_pool_rotates_across_all_configured_providers(monkeypatch):
+    monkeypatch.setenv("DEMO_GROQ_KEYS", "groq-key")
+    monkeypatch.setenv("DEMO_GEMINI_KEYS", "gemini-key")
+    monkeypatch.setenv("DEMO_OPENROUTER_KEYS", "openrouter-key")
+    monkeypatch.setenv("DEMO_OLLAMA_CLOUD_KEYS", "ollama-key")
+    monkeypatch.setenv("DEMO_NVIDIA_NIM_KEYS", "nvidia-key")
+
+    pool = build_endpoint_pool()
+    assert pool, "expected at least one endpoint"
+    providers = {endpoint.provider for endpoint in pool}
+    assert providers == {"groq", "gemini", "openrouter", "ollama_cloud", "nvidia_nim"}
+
+    # Every provider contributes at least 1 endpoint and at most MODELS_PER_PROVIDER.
+    per_provider: dict[str, int] = {}
+    for endpoint in pool:
+        per_provider[endpoint.provider] = per_provider.get(endpoint.provider, 0) + 1
+    for count in per_provider.values():
+        assert 1 <= count <= MODELS_PER_PROVIDER
+
+
+def test_pool_worker_model_is_tool_capable(monkeypatch):
+    monkeypatch.setenv("DEMO_GROQ_KEYS", "groq-key")
+    for endpoint in build_endpoint_pool():
+        if endpoint.provider == "groq":
+            assert endpoint.worker_model == "llama-3.3-70b-versatile"
+
+
+def test_next_demo_endpoint_round_robins(monkeypatch):
+    monkeypatch.setenv("DEMO_GROQ_KEYS", "groq-key")
+    monkeypatch.setenv("DEMO_GEMINI_KEYS", "gemini-key")
+    # Reset the module-level pool iterator.
+    import db_agent.demo_config as demo_config
+
+    demo_config._pool_iter = None
+    pool = build_endpoint_pool()
+    seen = [next_demo_endpoint() for _ in range(len(pool) * 2)]
+    first_cycle = seen[: len(pool)]
+    second_cycle = seen[len(pool):]
+    assert first_cycle == second_cycle
+    # The pool cycles over (provider, model) pairs, so consecutive picks differ.
+    assert any(
+        a.provider != b.provider or a.orchestrator_model != b.orchestrator_model
+        for a, b in zip(first_cycle, first_cycle[1:])
+    )
+    demo_config._pool_iter = None
+
+
+def test_pool_empty_when_no_keys(monkeypatch):
+    monkeypatch.delenv("DEMO_GROQ_KEYS", raising=False)
+    monkeypatch.delenv("DEMO_GEMINI_KEYS", raising=False)
+    monkeypatch.delenv("DEMO_OPENROUTER_KEYS", raising=False)
+    monkeypatch.delenv("DEMO_OLLAMA_CLOUD_KEYS", raising=False)
+    monkeypatch.delenv("DEMO_NVIDIA_NIM_KEYS", raising=False)
+    monkeypatch.delenv("groq_api_key", raising=False)
+    monkeypatch.delenv("gemini_api_key", raising=False)
+    monkeypatch.delenv("openrouter_api_key", raising=False)
+    monkeypatch.delenv("ollama-cloud_api_key", raising=False)
+    monkeypatch.delenv("nvidia_api_key", raising=False)
+    assert build_endpoint_pool() == []
 
 
 # ---------------------------------------------------------------------------

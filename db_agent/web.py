@@ -26,10 +26,10 @@ from typing import Any
 import streamlit as st
 
 from db_agent.demo_config import (
-    DEMO_ORCHESTRATOR_MODEL,
-    DEMO_WORKER_MODEL,
+    DemoEndpoint,
     demo_api_keys,
     make_key_rotator,
+    next_demo_endpoint,
 )
 from db_agent.gate import GateDecision
 from db_agent.guardrails import classify_risk, classify_statement
@@ -531,19 +531,34 @@ def _execute_request(user_query: str) -> None:
     httpx client is created and closed on the same loop.
     """
 
-    def _resolve_provider() -> tuple[str, str]:
-        """Return ``(provider, api_key)`` for the demo request."""
+    def _resolve_provider() -> tuple[str, str, str, str]:
+        """Return ``(provider, api_key, orchestrator_model, worker_model)``.
+
+        Demo mode rotates across a pool of (provider, model) endpoints so no
+        single provider's key/quota gets exhausted. If the pool is empty
+        (e.g. no provider configured), fall back to any single provider that
+        has a key and use its first static model for both roles.
+        """
         from db_agent.provider_config import load_provider_config
 
         session_name = st.session_state.session_name
+        endpoint = next_demo_endpoint()
+        if endpoint is not None:
+            rotator = st.session_state.key_rotators.get(endpoint.provider)
+            if rotator is None:
+                rotator = make_key_rotator(endpoint.provider)
+                st.session_state.key_rotators[endpoint.provider] = rotator
+            api_key = next(rotator)
+            return endpoint.provider, api_key, endpoint.orchestrator_model, endpoint.worker_model
+
+        # No endpoint pool: fall back to the first provider with a key.
         config = load_provider_config(session_name)
         provider = None
-        entry = None
         for candidate in ("groq", "gemini", "openrouter", "ollama_cloud", "nvidia_nim"):
             if config.active_provider == candidate and candidate in config.providers:
                 resolved = resolve_api_key(session_name, candidate, config.providers[candidate])
                 if resolved:
-                    provider, entry, _ = candidate, config.providers[candidate], resolved
+                    provider, _ = candidate, resolved
                     break
             keys = demo_api_keys(candidate)
             if keys:
@@ -559,7 +574,11 @@ def _execute_request(user_query: str) -> None:
             rotator = make_key_rotator(provider)
             st.session_state.key_rotators[provider] = rotator
         api_key = next(rotator)
-        return provider, api_key
+        from db_agent.providers.static_models import STATIC_MODELS
+
+        models = STATIC_MODELS.get(provider, [])
+        model = models[0].id if models else "gpt-4o-mini"
+        return provider, api_key, model, model
 
     async def _run() -> list[dict[str, Any]]:
         from db_agent.agents.orchestrator import plan_dag
@@ -568,12 +587,13 @@ def _execute_request(user_query: str) -> None:
 
         session_name = st.session_state.session_name
         db_uri = st.session_state.db_uri
-        provider, api_key = _resolve_provider()
+        provider, api_key, orchestrator_model, worker_model = _resolve_provider()
         adapter = create_adapter(provider, api_key)
         try:
-            # Demo mode: models are pinned constants — no /models list call.
+            # Demo mode: models come from the rotating endpoint pool — no
+            # /models list call per request.
             schema_text = _run_with_env(db_uri, session_name, get_schema)
-            dag = await plan_dag(user_query, schema_text, adapter, DEMO_ORCHESTRATOR_MODEL)
+            dag = await plan_dag(user_query, schema_text, adapter, orchestrator_model)
             if not dag:
                 return [{"result": "Failed to generate an execution plan.", "status": "error"}]
 
@@ -588,7 +608,7 @@ def _execute_request(user_query: str) -> None:
                     group_id,
                     _InProcessSession(db_uri, session_name),
                     adapter,
-                    DEMO_WORKER_MODEL,
+                    worker_model,
                     pre_execute_hook=_async_gate,
                 )
                 results.append({"result": result["result"], "status": result["status"]})

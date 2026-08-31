@@ -24,7 +24,6 @@ STATIC_MODELS: dict[str, list[ModelInfo]] = {
     ],
     "groq": [
         ModelInfo("llama-3.3-70b-versatile", "Llama 3.3 70B Versatile", 131072, True, None),
-        ModelInfo("llama-3.1-8b-instant", "Llama 3.1 8B Instant", 131072, True, None),
         ModelInfo("qwen/qwen3-32b", "Qwen3 32B", 131072, True, True),
     ],
 }

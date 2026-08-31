@@ -1,20 +1,39 @@
-"""Demo-mode configuration: pinned cheap models and round-robin API key rotation.
+"""Demo-mode configuration: rotating provider+model endpoints and API keys.
 
 Everything in this module is demo-mode-only. Local/CLI mode keeps its
-interactive provider setup and live model catalog; the demo fixes both models
-at deploy time and spreads traffic across a comma-separated list of keys
-round-robin, per query, with an in-memory counter (no cross-restart state).
+interactive provider setup and live model catalog. The demo builds a small
+endpoint pool at deploy time — 1-2 tool-capable models per provider that has a
+configured key — and spreads traffic across it round-robin, per query, so no
+single provider's key/quota gets exhausted. Keys within a provider rotate
+round-robin too, per query, with an in-memory counter (no cross-restart state).
 """
 
 from __future__ import annotations
 
 import itertools
 import os
+from dataclasses import dataclass
 
-# Fixed at deploy time — deliberately not resolved from /models list. The
-# worker must be tool-capable; the orchestrator just needs to be fast/cheap.
-DEMO_ORCHESTRATOR_MODEL = "llama-3.1-8b-instant"
-DEMO_WORKER_MODEL = "llama-3.1-8b-instant"
+from db_agent.providers.static_models import STATIC_MODELS
+
+# How many models per provider to include in the demo rotation pool. The
+# orchestrator just needs to be fast/cheap; the worker must be tool-capable.
+# Keeping this at 1-2 spreads load across providers instead of hammering one.
+MODELS_PER_PROVIDER = 2
+
+# Provider order for the pool: rotate in this order so traffic spreads across
+# all configured providers evenly.
+POOL_PROVIDERS = ("groq", "gemini", "openrouter", "ollama_cloud", "nvidia_nim")
+
+
+@dataclass(frozen=True)
+class DemoEndpoint:
+    """A rotating endpoint: provider, api key, and orchestrator/worker models."""
+
+    provider: str
+    api_key: str
+    orchestrator_model: str
+    worker_model: str
 
 
 def demo_env_var(provider: str) -> str:
@@ -49,3 +68,55 @@ def _new_rotator(keys: list[str]):
 def make_key_rotator(provider: str):
     """Create a round-robin key rotator for a provider's demo key list."""
     return _new_rotator(demo_api_keys(provider))
+
+
+def build_endpoint_pool() -> list[DemoEndpoint]:
+    """Build the demo endpoint pool from configured providers.
+
+    A provider is included only if it has at least one resolvable key. For
+    each such provider we take up to ``MODELS_PER_PROVIDER`` tool-capable
+    models from the static catalog, preferring the first entries (which are
+    the cheapest/fastest). The orchestrator uses the first model; the worker
+    uses the first model that supports tools (falling back to the same one).
+    """
+    pool: list[DemoEndpoint] = []
+    for provider in POOL_PROVIDERS:
+        keys = demo_api_keys(provider)
+        if not keys:
+            continue
+        models = STATIC_MODELS.get(provider, [])
+        candidates = [
+            m for m in models
+            if m.supports_chat is not False
+            and m.modality in (None, "", "text")
+        ][:MODELS_PER_PROVIDER]
+        if not candidates:
+            continue
+        for model in candidates:
+            worker_model = next(
+                (m.id for m in candidates if m.supports_tools is not False),
+                model.id,
+            )
+            pool.append(
+                DemoEndpoint(
+                    provider=provider,
+                    api_key=keys[0],
+                    orchestrator_model=model.id,
+                    worker_model=worker_model,
+                )
+            )
+    return pool
+
+
+_pool_iter: itertools.cycle | None = None
+
+
+def next_demo_endpoint() -> DemoEndpoint | None:
+    """Return the next pool endpoint round-robin, or None if no provider is configured."""
+    global _pool_iter
+    if _pool_iter is None:
+        pool = build_endpoint_pool()
+        if not pool:
+            return None
+        _pool_iter = itertools.cycle(pool)
+    return next(_pool_iter)
