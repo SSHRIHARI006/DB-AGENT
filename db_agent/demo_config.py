@@ -108,15 +108,30 @@ def build_endpoint_pool() -> list[DemoEndpoint]:
     return pool
 
 
+_pool: list[DemoEndpoint] | None = None
 _pool_iter: itertools.cycle | None = None
 
 
-def next_demo_endpoint() -> DemoEndpoint | None:
-    """Return the next pool endpoint round-robin, or None if no provider is configured."""
-    global _pool_iter
+def _ensure_pool() -> None:
+    """Build the endpoint pool once and keep a round-robin iterator over it."""
+    global _pool, _pool_iter
+    if _pool is None:
+        _pool = build_endpoint_pool()
+        _pool_iter = itertools.cycle(_pool) if _pool else None
+
+
+def next_demo_endpoint(skip: set[str] | None = None) -> DemoEndpoint | None:
+    """Return the next pool endpoint round-robin, skipping ``skip`` providers.
+
+    ``skip`` is a set of provider names (e.g. ones that failed this session)
+    so a dead endpoint fails over to the next provider instead of being
+    repeated. Returns None if no pool exists or every endpoint is skipped.
+    """
+    _ensure_pool()
     if _pool_iter is None:
-        pool = build_endpoint_pool()
-        if not pool:
-            return None
-        _pool_iter = itertools.cycle(pool)
-    return next(_pool_iter)
+        return None
+    for _ in range(len(_pool) * 2):
+        endpoint = next(_pool_iter)
+        if skip is None or endpoint.provider not in skip:
+            return endpoint
+    return None

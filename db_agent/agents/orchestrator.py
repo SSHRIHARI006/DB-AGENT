@@ -40,6 +40,12 @@ User Request: {user_query}
                 temperature=0.1,
                 response_format="json",
             )
+        except Exception as exc:
+            # A dead endpoint must be visible to the caller so it can fail
+            # over to another provider — never mask it with a fallback plan.
+            obs.end(output={"status": "error", "error": str(exc)})
+            raise
+        try:
             dag = json.loads(result.text)
             if not isinstance(dag, list):
                 dag = [dag]

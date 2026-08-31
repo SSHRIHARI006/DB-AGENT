@@ -88,9 +88,10 @@ def test_pool_worker_model_is_tool_capable(monkeypatch):
 def test_next_demo_endpoint_round_robins(monkeypatch):
     monkeypatch.setenv("DEMO_GROQ_KEYS", "groq-key")
     monkeypatch.setenv("DEMO_GEMINI_KEYS", "gemini-key")
-    # Reset the module-level pool iterator.
+    # Reset the module-level pool.
     import db_agent.demo_config as demo_config
 
+    demo_config._pool = None
     demo_config._pool_iter = None
     pool = build_endpoint_pool()
     seen = [next_demo_endpoint() for _ in range(len(pool) * 2)]
@@ -102,6 +103,24 @@ def test_next_demo_endpoint_round_robins(monkeypatch):
         a.provider != b.provider or a.orchestrator_model != b.orchestrator_model
         for a, b in zip(first_cycle, first_cycle[1:])
     )
+    demo_config._pool = None
+    demo_config._pool_iter = None
+
+
+def test_next_demo_endpoint_skips_failed_providers(monkeypatch):
+    monkeypatch.setenv("DEMO_GROQ_KEYS", "groq-key")
+    monkeypatch.setenv("DEMO_GEMINI_KEYS", "gemini-key")
+    import db_agent.demo_config as demo_config
+
+    demo_config._pool = None
+    demo_config._pool_iter = None
+    pool = build_endpoint_pool()
+    # Blacklist the first provider: every pick must come from another provider.
+    first_provider = pool[0].provider
+    seen = {next_demo_endpoint(skip={first_provider}).provider for _ in range(len(pool) * 2)}
+    assert first_provider not in seen
+    assert seen == {endpoint.provider for endpoint in pool} - {first_provider}
+    demo_config._pool = None
     demo_config._pool_iter = None
 
 
@@ -161,6 +180,74 @@ class _FakeSessionState(dict):
 
     def __setattr__(self, name, value):
         self[name] = value
+
+
+def test_execute_request_fails_over_to_another_provider(monkeypatch, tmp_path):
+    """A dead endpoint (model error) must be blacklisted and the request
+    retried on the next provider, not shown as an LLM Connection Error."""
+    import sqlite3
+
+    import db_agent.demo_config as demo_config
+    import db_agent.providers as prov
+    import db_agent.web as web
+    from db_agent.providers.base import GenerationResult, ProviderRequestError, ToolCall
+
+    database = tmp_path / "failover.db"
+    with sqlite3.connect(database) as conn:
+        conn.execute("CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT NOT NULL)")
+        conn.execute("INSERT INTO users VALUES (1, 'Alice')")
+
+    monkeypatch.setenv("DEMO_GROQ_KEYS", "groq-key")
+    monkeypatch.setenv("DEMO_GEMINI_KEYS", "gemini-key")
+    demo_config._pool = None
+    demo_config._pool_iter = None
+
+    st = _FakeSessionState()
+    st.session_name = "failover-test"
+    st.db_uri = f"sqlite:///{database}"
+    st.tries = 0
+    st.key_rotators = {}
+    st.failed_endpoints = set()
+    st.last_results = []
+    st.last_diff = None
+    st.schema_text = "CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT NOT NULL)"
+    st.pending_mutation = None
+    monkeypatch.setattr(web.st, "session_state", st)
+
+    calls: list[str] = []
+
+    class FakeAdapter:
+        def __init__(self, provider, api_key):
+            self.provider = provider
+
+        async def generate(self, **kwargs):
+            calls.append(self.provider)
+            if self.provider == "groq":
+                raise ProviderRequestError("groq", "The model does not exist")
+            if kwargs.get("tools"):
+                return GenerationResult(
+                    tool_calls=[ToolCall("read_query", {"sql_query": "SELECT * FROM users"}, "c1")]
+                )
+            return GenerationResult(text='[{"id": 1, "intent": "list all users", "depends_on": []}]')
+
+        async def close(self):
+            pass
+
+    real_create = prov.create_adapter
+    monkeypatch.setattr(
+        prov,
+        "create_adapter",
+        lambda provider, api_key, base_url=None, *, client=None: FakeAdapter(provider, api_key),
+    )
+    try:
+        web._execute_request("list all users")
+    finally:
+        prov.create_adapter = real_create
+
+    assert "groq" in st.failed_endpoints
+    assert "groq" in calls
+    assert any(provider != "groq" for provider in calls)
+    assert st.last_results, "expected a successful result from the fallback provider"
 
 
 def test_undo_is_parked_requires_confirm(monkeypatch):

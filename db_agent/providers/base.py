@@ -47,6 +47,11 @@ class ProviderRequestError(ProviderError):
     pass
 
 
+class LLMConnectionError(ProviderError):
+    """The model endpoint itself failed (bad model id, no access, network).
+    Raised so callers can fail over to another provider/endpoint."""
+
+
 class ProviderAdapter(ABC):
     name: str
 

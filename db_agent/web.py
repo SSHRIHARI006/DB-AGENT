@@ -193,6 +193,10 @@ def _init_state() -> None:
         # One rotator per provider, kept per browser session. Rotating a fresh
         # rotator on every click would defeat round-robin across queries.
         st.session_state.key_rotators = {}
+    if "failed_endpoints" not in st.session_state:
+        # Providers blacklisted for the session after an LLM error, so the
+        # pool fails over to the next provider instead of repeating a dead one.
+        st.session_state.failed_endpoints = set()
     if "schema_text" not in st.session_state:
         # Static sandboxed schema: fetch once per session, not per query.
         st.session_state.schema_text = _run_with_env(
@@ -362,6 +366,9 @@ def _display_results(results: list[str], diffs: list[dict] | None) -> None:
 
 
 def main() -> None:
+    from db_agent.env_loader import load_dotenv
+
+    load_dotenv()
     st.set_page_config(page_title="DB-Agent Demo", page_icon="🗄️", layout="wide")
     _init_state()
 
@@ -531,18 +538,19 @@ def _execute_request(user_query: str) -> None:
     httpx client is created and closed on the same loop.
     """
 
-    def _resolve_provider() -> tuple[str, str, str, str]:
-        """Return ``(provider, api_key, orchestrator_model, worker_model)``.
+    def _next_endpoint() -> tuple[str, str, str, str]:
+        """Return the next ``(provider, api_key, orchestrator_model, worker_model)``.
 
         Demo mode rotates across a pool of (provider, model) endpoints so no
-        single provider's key/quota gets exhausted. If the pool is empty
-        (e.g. no provider configured), fall back to any single provider that
+        single provider's key/quota gets exhausted. Endpoints that have failed
+        in this session are skipped, so a dead model/key fails over to the next
+        provider. If the pool is empty, fall back to any single provider that
         has a key and use its first static model for both roles.
         """
         from db_agent.provider_config import load_provider_config
 
         session_name = st.session_state.session_name
-        endpoint = next_demo_endpoint()
+        endpoint = next_demo_endpoint(skip=st.session_state.failed_endpoints)
         if endpoint is not None:
             rotator = st.session_state.key_rotators.get(endpoint.provider)
             if rotator is None:
@@ -551,14 +559,14 @@ def _execute_request(user_query: str) -> None:
             api_key = next(rotator)
             return endpoint.provider, api_key, endpoint.orchestrator_model, endpoint.worker_model
 
-        # No endpoint pool: fall back to the first provider with a key.
+        # No usable pool endpoint: fall back to the first provider with a key.
         config = load_provider_config(session_name)
         provider = None
         for candidate in ("groq", "gemini", "openrouter", "ollama_cloud", "nvidia_nim"):
             if config.active_provider == candidate and candidate in config.providers:
                 resolved = resolve_api_key(session_name, candidate, config.providers[candidate])
                 if resolved:
-                    provider, _ = candidate, resolved
+                    provider = candidate
                     break
             keys = demo_api_keys(candidate)
             if keys:
@@ -580,41 +588,66 @@ def _execute_request(user_query: str) -> None:
         model = models[0].id if models else "gpt-4o-mini"
         return provider, api_key, model, model
 
+    def _mark_failed(provider: str) -> None:
+        """Blacklist a provider for the rest of this session after an LLM error."""
+        st.session_state.failed_endpoints.add(provider)
+
     async def _run() -> list[dict[str, Any]]:
         from db_agent.agents.orchestrator import plan_dag
         from db_agent.agents.worker import execute_task
-        from db_agent.providers import create_adapter
+        from db_agent.providers import ProviderError, create_adapter
 
         session_name = st.session_state.session_name
         db_uri = st.session_state.db_uri
-        provider, api_key, orchestrator_model, worker_model = _resolve_provider()
-        adapter = create_adapter(provider, api_key)
-        try:
-            # Demo mode: models come from the rotating endpoint pool — no
-            # /models list call per request.
-            schema_text = _run_with_env(db_uri, session_name, get_schema)
-            dag = await plan_dag(user_query, schema_text, adapter, orchestrator_model)
-            if not dag:
-                return [{"result": "Failed to generate an execution plan.", "status": "error"}]
+        schema_text = _run_with_env(db_uri, session_name, get_schema)
 
-            import secrets
+        import secrets
 
-            group_id = secrets.token_hex(4)
-            results: list[dict[str, Any]] = []
-            for task in dag:
-                result = await execute_task(
-                    task,
-                    schema_text,
-                    group_id,
-                    _InProcessSession(db_uri, session_name),
-                    adapter,
-                    worker_model,
-                    pre_execute_hook=_async_gate,
-                )
-                results.append({"result": result["result"], "status": result["status"]})
-            return results
-        finally:
-            await adapter.close()
+        group_id = secrets.token_hex(4)
+        # Plan once on the first working endpoint.
+        dag = None
+        for _attempt in range(10):
+            provider, api_key, orchestrator_model, _worker_model = _next_endpoint()
+            adapter = create_adapter(provider, api_key)
+            try:
+                dag = await plan_dag(user_query, schema_text, adapter, orchestrator_model)
+                if dag:
+                    break
+            except ProviderError:
+                _mark_failed(provider)
+                continue
+            finally:
+                await adapter.close()
+        if not dag:
+            return [{"result": "Failed to generate an execution plan.", "status": "error"}]
+
+        results: list[dict[str, Any]] = []
+        for task in dag:
+            task_result = None
+            for _attempt in range(10):
+                provider, api_key, _orch_model, worker_model = _next_endpoint()
+                adapter = create_adapter(provider, api_key)
+                try:
+                    task_result = await execute_task(
+                        task,
+                        schema_text,
+                        group_id,
+                        _InProcessSession(db_uri, session_name),
+                        adapter,
+                        worker_model,
+                        pre_execute_hook=_async_gate,
+                    )
+                    break
+                except ProviderError:
+                    # A dead endpoint: blacklist it and retry on the next provider.
+                    _mark_failed(provider)
+                    continue
+                finally:
+                    await adapter.close()
+            if task_result is None:
+                return [{"result": "Failed after trying all providers.", "status": "error"}]
+            results.append({"result": task_result["result"], "status": task_result["status"]})
+        return results
 
     try:
         results = asyncio.run(_run())

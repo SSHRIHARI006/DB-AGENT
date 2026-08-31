@@ -1,5 +1,6 @@
 from db_agent.providers.base import (
     GenerationResult,
+    LLMConnectionError,
     ModelInfo,
     ProviderAdapter,
     ProviderAuthError,
@@ -18,6 +19,7 @@ from db_agent.providers.factory import (
 
 __all__ = [
     "GenerationResult",
+    "LLMConnectionError",
     "ModelInfo",
     "ProviderAdapter",
     "ProviderAuthError",

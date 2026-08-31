@@ -176,8 +176,12 @@ async def _execute_task_impl(
                 temperature=0.1,
             )
         except Exception as exc:
+            # A dead endpoint must be visible to the caller so it can fail
+            # over to another provider — never mask it as a normal error.
             obs.end(output={"status": "error", "error": f"LLM Connection Error: {exc}"})
-            return {"status": "error", "result": f"LLM Connection Error: {exc}"}
+            from db_agent.providers.base import LLMConnectionError
+
+            raise LLMConnectionError(adapter.name, str(exc)) from exc
 
         calls = _normalized_calls(result, valid_tool_names)
         if not calls:

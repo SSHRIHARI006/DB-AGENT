@@ -805,15 +805,18 @@ async def run_chat_loop(db_uri: str, session_name: str, mcp_session: ClientSessi
                 
             async def run_worker(task):
                 console.print(f"[yellow]Running Task {task['id']}: {task.get('intent')}[/yellow]")
-                result = await execute_task(
-                    task,
-                    schema_text,
-                    group_id,
-                    mcp_session,
-                    adapter,
-                    worker_model,
-                    pre_execute_hook=_cli_gate,
-                )
+                try:
+                    result = await execute_task(
+                        task,
+                        schema_text,
+                        group_id,
+                        mcp_session,
+                        adapter,
+                        worker_model,
+                        pre_execute_hook=_cli_gate,
+                    )
+                except ProviderError as exc:
+                    result = {"status": "error", "result": f"LLM Connection Error: {exc}"}
                 if result["status"] == "success":
                     console.print(f"[green]Task {task['id']} completed.[/green]")
                 else:
